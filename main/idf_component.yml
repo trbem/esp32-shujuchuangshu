@@ -1,0 +1,6 @@
+dependencies:
+  sensor_init:
+    path: ${IDF_PATH}/examples/peripherals/camera/common_components/sensor_init
+  espressif/mdns: '*'
+  espressif/qma6100p:
+    version: "^2.0.1"

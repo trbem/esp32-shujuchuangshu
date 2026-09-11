@@ -1,0 +1,25 @@
+# Build output
+build/
+build_*/
+*.bin
+*.elf
+*.map
+
+# ESP-IDF local configuration (holds Wi-Fi credentials - never commit)
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+sdkconfig.ci.*
+
+# Managed components are pulled in by `idf.py reconfigure` from
+# dependencies.lock, so there is no need to commit them.
+managed_components/
+
+# Debug / capture artefacts
+*.log
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

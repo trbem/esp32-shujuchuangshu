@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-S3-EYE 传感器面板</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#30363d;
+    --text:#e6edf3; --muted:#8b949e; --accent:#2f81f7;
+    --green:#3fb950; --yellow:#d29922; --red:#f85149; --purple:#a371f7; --cyan:#39c5cf;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);min-height:100vh;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:20px}
+  .wrap{max-width:1280px;margin:0 auto}
+  header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px}
+  h1{font-size:20px;font-weight:600;display:flex;align-items:center;gap:10px}
+  h1 .chip{font-size:11px;font-weight:500;color:var(--muted);border:1px solid var(--border);
+           border-radius:20px;padding:3px 10px}
+  .status{display:flex;align-items:center;gap:14px;font-size:13px;color:var(--muted)}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);display:inline-block}
+  .dot.live{background:var(--green);box-shadow:0 0 0 3px rgba(63,185,80,.18);animation:pulse 2s infinite}
+  .dot.mock{background:var(--yellow)}
+  .dot.err{background:var(--red)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  .badge{border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:12px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;
+        position:relative;overflow:hidden}
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);opacity:.85}
+  .card.c-green::before{background:var(--green)}
+  .card.c-yellow::before{background:var(--yellow)}
+  .card.c-purple::before{background:var(--purple)}
+  .card.c-cyan::before{background:var(--cyan)}
+  .card.c-red::before{background:var(--red)}
+  .label{font-size:12px;color:var(--muted);margin-bottom:8px;letter-spacing:.3px}
+  .value{font-size:26px;font-weight:600;line-height:1.1;font-variant-numeric:tabular-nums}
+  .value .unit{font-size:13px;font-weight:400;color:var(--muted);margin-left:4px}
+  .sub{font-size:11px;color:var(--muted);margin-top:6px}
+  .cam{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+       padding:14px 16px;margin-bottom:16px}
+  .cam-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
+  .cam-meta{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .cam img{width:320px;max-width:100%;height:auto;display:block;border-radius:6px;
+           background:#000;border:1px solid var(--border)}
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+  @media(max-width:860px){.charts{grid-template-columns:1fr}}
+  .chart-box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+  .chart-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;gap:8px}
+  .chart-title{font-size:13px;font-weight:500}
+  .chart-now{font-size:15px;font-variant-numeric:tabular-nums;font-weight:600}
+  canvas{width:100%;height:150px;display:block}
+  .legend{display:flex;gap:10px;font-size:11px;color:var(--muted);align-items:center;flex-wrap:wrap}
+  .legend i{width:8px;height:8px;border-radius:2px;display:inline-block;margin-right:4px;vertical-align:middle}
+  #attChart{height:170px}
+  .att-read{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);
+            margin-top:8px;font-variant-numeric:tabular-nums}
+  .att-read b{color:var(--text);font-weight:600}
+  .warnbar{display:none;background:rgba(248,81,73,.10);border:1px solid rgba(248,81,73,.4);
+           color:#ffa198;border-radius:8px;padding:9px 14px;font-size:12.5px;margin-bottom:14px}
+  .warnbar.on{display:block}
+  .chip-imu{border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:11.5px;
+            color:var(--muted);font-variant-numeric:tabular-nums}
+  .chip-imu b{color:var(--green);font-weight:600}
+  .log{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 16px}
+  .log h3{font-size:12px;color:var(--muted);font-weight:500;margin-bottom:8px}
+  .log pre{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:var(--muted);
+           max-height:120px;overflow:auto;line-height:1.65;white-space:pre-wrap;word-break:break-all}
+  .hint{margin-top:14px;font-size:12px;color:var(--muted);line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>ESP32-S3-EYE 传感器面板 <span class="chip" id="chipLabel">ESP32-S3 · 8MB PSRAM</span></h1>
+    <div class="status">
+      <span id="srcText">连接中…</span>
+      <span class="dot" id="dot"></span>
+      <span class="badge" id="rateText">-- Hz</span>
+      <span class="badge" id="uptimeText">--</span>
+      <span class="chip-imu" id="imuChip">IMU 检测中…</span>
+    </div>
+  </header>
+
+  <div class="warnbar" id="imuWarn">
+    未检测到三轴加速度计（QMA6100P / QMA7981）。三轴数值与姿态仪会显示为「未连接」，其余指标不受影响。
+  </div>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="cam">
+    <div class="cam-head">
+      <span class="chart-title">摄像头实时画面 · OV2640 JPEG 320×240</span>
+      <span class="cam-meta" id="camMeta">--</span>
+    </div>
+    <img id="camImg" alt="camera live view">
+  </div>
+
+  <div class="charts">
+    <div class="chart-box">
+      <div class="chart-head"><span class="chart-title">芯片温度</span><span class="chart-now" id="tempNow">--</span></div>
+      <canvas id="tempChart"></canvas>
+    </div>
+    <div class="chart-box">
+      <div class="chart-head"><span class="chart-title">内存（内部 SRAM / PSRAM）</span><span class="chart-now" id="memNow">--</span></div>
+      <canvas id="memChart"></canvas>
+    </div>
+    <div class="chart-box">
+      <div class="chart-head">
+        <span class="chart-title">三轴加速度</span>
+        <span class="legend">
+          <span><i style="background:#f85149"></i>X</span>
+          <span><i style="background:#3fb950"></i>Y</span>
+          <span><i style="background:#58a6ff"></i>Z</span>
+          <span><i style="background:#d29922"></i>|a|</span>
+        </span>
+        <span class="chart-now" id="accelNow">--</span>
+      </div>
+      <canvas id="accelChart"></canvas>
+    </div>
+    <div class="chart-box">
+      <div class="chart-head"><span class="chart-title">姿态仪（Roll / Pitch）</span><span class="chart-now" id="attNow">--</span></div>
+      <canvas id="attChart"></canvas>
+      <div class="att-read">
+        <span>Roll <b id="rollText">--</b></span>
+        <span>Pitch <b id="pitchText">--</b></span>
+        <span>倾角 <b id="tiltText">--</b></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="log">
+    <h3>最近数据（板子返回的原始 JSON）</h3>
+    <pre id="logBox">等待数据…</pre>
+  </div>
+
+  <div class="hint" id="hint">数据每 500ms 从板子刷新一次。姿态仪由重力矢量算得：Roll = atan2(Y, Z)，Pitch = atan2(−X, √(Y²+Z²))，板子水平放置时合加速度 |a| ≈ 1 g。</div>
+</div>
+
+<script>
+const CARDS = [
+  {key:'temp_c',    label:'芯片温度',   unit:'°C',  fix:1, color:'c-yellow', warn:v=>v>70},
+  {key:'heap_int',  label:'内部 SRAM',  unit:'KB',  fix:0, color:'c-green',  scale:1/1024},
+  {key:'heap_psram',label:'PSRAM',      unit:'MB',  fix:2, color:'c-purple', scale:1/1048576},
+  {key:'fps',       label:'摄像头帧率', unit:'fps', fix:0, color:'c-cyan'},
+  {key:'jpeg',      label:'JPEG 帧大小', unit:'KB', fix:1, color:'', scale:1/1024},
+  {key:'accel_x_g', label:'加速度 X',    unit:'g',   fix:3, color:'', accel:true},
+  {key:'accel_y_g', label:'加速度 Y',    unit:'g',   fix:3, color:'', accel:true},
+  {key:'accel_z_g', label:'加速度 Z',    unit:'g',   fix:3, color:'', accel:true},
+  {key:'accel_mag_g',label:'合加速度 |a|',unit:'g',  fix:3, color:'c-green', accel:true,
+   sub:v=>(Math.abs(v)<0.85||Math.abs(v)>1.18) ? '非静止或需校准' : '静止 ≈ 1 g'},
+  {key:'rssi',      label:'WiFi 信号',  unit:'dBm', fix:0, color:'c-cyan'},
+];
+const HISTORY = 120;
+let samples = [], lastTime = performance.now(), rate = 0;
+
+const cardEls = {};
+function buildCards(){
+  const box = document.getElementById('cards');
+  CARDS.forEach(c=>{
+    const el = document.createElement('div');
+    el.className = 'card ' + c.color;
+    el.innerHTML = `<div class="label">${c.label}</div>
+      <div class="value"><span class="num">--</span><span class="unit">${c.unit}</span></div>
+      <div class="sub"></div>`;
+    box.appendChild(el);
+    cardEls[c.key] = el;
+  });
+}
+function renderCards(d){
+  CARDS.forEach(c=>{
+    const el = cardEls[c.key];
+    const raw = d[c.key];
+    if(c.accel && !d.accel_ok){
+      el.querySelector('.num').textContent = '--';
+      el.querySelector('.unit').textContent = '未连接';
+      el.querySelector('.sub').textContent = '';
+      return;
+    }
+    el.querySelector('.unit').textContent = c.unit;
+    if(raw === undefined || raw === null){ el.querySelector('.num').textContent = '--'; return; }
+    el.querySelector('.num').textContent = (raw * (c.scale || 1)).toFixed(c.fix);
+    el.querySelector('.sub').textContent = c.sub ? c.sub(raw * (c.scale || 1)) : '';
+    if(c.warn) el.classList.toggle('c-red', c.warn(raw));
+  });
+}
+function setupCanvas(cv){
+  const dpr = window.devicePixelRatio || 1, r = cv.getBoundingClientRect();
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  const ctx = cv.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx, w:r.width, h:r.height};
+}
+function drawSeries(cvId, series, opts){
+  const cv = document.getElementById(cvId);
+  const {ctx,w,h} = setupCanvas(cv);
+  ctx.clearRect(0,0,w,h);
+  const pad = 4;
+  let min = opts.min, max = opts.max;
+  series.forEach(s=>s.data.forEach(v=>{ if(v<min)min=v; if(v>max)max=v; }));
+  if(max-min < 1e-6) max = min + 1;
+  const X = i => pad + i*(w-2*pad)/(HISTORY-1);
+  const Y = v => h-pad - (v-min)*(h-2*pad)/(max-min);
+  ctx.strokeStyle = 'rgba(139,148,158,.13)'; ctx.lineWidth = 1;
+  for(let g=0; g<=3; g++){ const y = pad + g*(h-2*pad)/3;
+    ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(w-pad,y); ctx.stroke(); }
+  ctx.fillStyle = '#6e7681'; ctx.font = '10px sans-serif';
+  ctx.fillText(max.toFixed(0), 6, 12); ctx.fillText(min.toFixed(0), 6, h-6);
+  series.forEach(s=>{
+    if(s.data.length < 2) return;
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.8; ctx.lineJoin='round';
+    ctx.beginPath();
+    s.data.forEach((v,i)=>{ const x=X(i), y=Y(v); i? ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.stroke();
+    ctx.lineTo(X(s.data.length-1), h-pad); ctx.lineTo(X(0), h-pad); ctx.closePath();
+    ctx.fillStyle = s.fill || 'rgba(47,129,247,.10)'; ctx.fill();
+  });
+}
+/* ---- attitude indicator (artificial horizon) drawn from the gravity vector ---- */
+function drawAttitude(x, y, z, ok){
+  const cv = document.getElementById('attChart');
+  const {ctx,w,h} = setupCanvas(cv);
+  ctx.clearRect(0,0,w,h);
+  const cx = w/2, cy = h/2, R = Math.min(w, h)/2 - 8;
+  if(R <= 0) return;
+
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI*2); ctx.clip();
+  ctx.fillStyle = '#0b1220'; ctx.fillRect(0, 0, w, h);
+
+  if(ok){
+    const roll  = Math.atan2(y, z) * 180 / Math.PI;
+    const pitch = Math.atan2(-x, Math.sqrt(y*y + z*z)) * 180 / Math.PI;
+    const ppd = R / 45;                     /* 45° from centre to the bezel */
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(-roll * Math.PI / 180);
+    ctx.translate(0, pitch * ppd);
+    ctx.fillStyle = 'rgba(56,139,253,.32)';           /* sky   */
+    ctx.fillRect(-2*R, -8*R, 4*R, 8*R);
+    ctx.fillStyle = 'rgba(163,113,247,.30)';          /* ground */
+    ctx.fillRect(-2*R, 0,    4*R, 8*R);
+    ctx.strokeStyle = '#e6edf3'; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(-2*R, 0); ctx.lineTo(2*R, 0); ctx.stroke();
+    ctx.strokeStyle = 'rgba(230,237,243,.42)'; ctx.lineWidth = 1;
+    ctx.fillStyle = 'rgba(230,237,243,.6)';
+    ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+    for(let d = -30; d <= 30; d += 15){
+      if(d === 0) continue;
+      const yy = -d * ppd, half = (d % 30 === 0) ? R*0.42 : R*0.22;
+      ctx.beginPath(); ctx.moveTo(-half, yy); ctx.lineTo(half, yy); ctx.stroke();
+      if(d % 30 === 0) ctx.fillText(String(d), 0, yy - 3);
+    }
+    ctx.restore();
+
+    /* roll pointer riding on the bezel */
+    ctx.save();
+    ctx.translate(cx, cy); ctx.rotate(-roll * Math.PI / 180);
+    ctx.beginPath();
+    ctx.moveTo(0, -R + 2); ctx.lineTo(-5, -R + 10); ctx.lineTo(5, -R + 10); ctx.closePath();
+    ctx.fillStyle = '#f85149'; ctx.fill();
+    ctx.restore();
+  } else {
+    ctx.fillStyle = '#6e7681'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('加速度计未连接', cx, cy + 4);
+  }
+  ctx.restore();
+
+  /* fixed aircraft reference + bezel */
+  ctx.strokeStyle = '#f85149'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx - R*0.55, cy); ctx.lineTo(cx - R*0.16, cy);
+  ctx.moveTo(cx + R*0.16, cy); ctx.lineTo(cx + R*0.55, cy);
+  ctx.moveTo(cx, cy - R*0.05); ctx.lineTo(cx, cy + R*0.05);
+  ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI*2);
+  ctx.strokeStyle = '#30363d'; ctx.lineWidth = 2; ctx.stroke();
+}
+
+function renderCharts(){
+  drawSeries('tempChart', [{data:samples.map(s=>s.temp_c ?? 0), color:'#d29922', fill:'rgba(210,153,34,.12)'}], {min:20,max:80});
+  drawSeries('memChart', [
+    {data:samples.map(s=>(s.heap_int ?? 0)/1024),    color:'#3fb950', fill:'rgba(63,185,80,.10)'},
+    {data:samples.map(s=>(s.heap_psram ?? 0)/1048576), color:'#a371f7', fill:'rgba(163,113,247,.10)'}
+  ], {min:0,max:8});
+
+  const last = samples[samples.length-1] || {};
+  const ok = !!last.accel_ok;
+  const fs = last.accel_range_g || 4;
+  drawSeries('accelChart', [
+    {data:samples.map(s=>s.accel_ok ? s.accel_x_g : 0), color:'#f85149', fill:'rgba(248,81,73,.08)'},
+    {data:samples.map(s=>s.accel_ok ? s.accel_y_g : 0), color:'#3fb950', fill:'rgba(63,185,80,.08)'},
+    {data:samples.map(s=>s.accel_ok ? s.accel_z_g : 0), color:'#58a6ff', fill:'rgba(88,166,255,.08)'},
+    {data:samples.map(s=>s.accel_ok ? (s.accel_mag_g ?? 0) : 0), color:'#d29922', fill:'rgba(210,153,34,.05)'}
+  ], {min:-fs, max:fs});
+
+  document.getElementById('tempNow').textContent = last.temp_c!=null ? last.temp_c.toFixed(1)+' °C' : '--';
+  document.getElementById('memNow').textContent = last.heap_psram!=null
+    ? (last.heap_psram/1048576).toFixed(2)+' MB / '+(last.heap_int/1024).toFixed(0)+' KB' : '--';
+
+  document.getElementById('accelNow').textContent = (ok && last.accel_mag_g!=null)
+    ? last.accel_mag_g.toFixed(3) + ' g' : '--';
+  document.getElementById('accelNow').style.color = ok ? '' : '#6e7681';
+
+  const x = ok ? last.accel_x_g : 0, y = ok ? last.accel_y_g : 0, z = ok ? last.accel_z_g : 0;
+  drawAttitude(x, y, z, ok);
+  if(ok){
+    const roll  = Math.atan2(y, z) * 180 / Math.PI;
+    const pitch = Math.atan2(-x, Math.sqrt(y*y + z*z)) * 180 / Math.PI;
+    const tilt  = Math.acos(Math.min(1, Math.abs(z) / Math.max(1e-6, Math.hypot(x,y,z)))) * 180 / Math.PI;
+    document.getElementById('rollText').textContent  = roll.toFixed(1)  + '°';
+    document.getElementById('pitchText').textContent = pitch.toFixed(1) + '°';
+    document.getElementById('tiltText').textContent  = tilt.toFixed(1)  + '°';
+    document.getElementById('attNow').textContent    = tilt.toFixed(1)  + '°';
+  } else {
+    ['rollText','pitchText','tiltText'].forEach(id=>document.getElementById(id).textContent='--');
+    document.getElementById('attNow').textContent = '--';
+  }
+}
+function fmtUptime(s){ s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
+  return h>0 ? `${h}h${m}m${s%60}s` : `${m}m${s%60}s`; }
+function setStatus(mode, text){
+  document.getElementById('dot').className = 'dot ' + (mode==='live'?'live':mode==='mock'?'mock':'err');
+  document.getElementById('srcText').textContent = text;
+}
+function push(d){
+  samples.push(d); if(samples.length > HISTORY) samples.shift();
+  renderCards(d); renderCharts();
+  const warn = document.getElementById('imuWarn');
+  warn.classList.toggle('on', d.accel_ok === false);
+  if(d.accel_ok){
+    document.getElementById('imuChip').innerHTML =
+      'IMU <b>' + (d.accel_chip || 'QST') + '</b> · WHO_AM_I ' + (d.accel_id || '--') +
+      ' · ±' + (d.accel_range_g || 4) + 'g';
+  } else {
+    document.getElementById('imuChip').textContent = 'IMU 未连接';
+  }
+  if(d.uptime_s != null) document.getElementById('uptimeText').textContent = '运行 ' + fmtUptime(d.uptime_s);
+  if(d.jpeg != null) document.getElementById('camMeta').textContent =
+    (d.jpeg/1024).toFixed(1) + ' KB / 帧 · ' + (d.fps != null ? d.fps.toFixed(0) + ' fps' : '--');
+  const log = document.getElementById('logBox');
+  log.textContent = JSON.stringify(d) + '\n' + log.textContent.split('\n').slice(0,6).join('\n');
+}
+async function tick(){
+  try{
+    const r = await fetch('/data?t=' + Date.now(), {cache:'no-store'});
+    if(!r.ok) throw new Error('http ' + r.status);
+    const d = await r.json();
+    setStatus('live', 'ESP32-S3-EYE · ' + (d.ip || '已连接'));
+    push(d);
+  }catch(e){
+    setStatus('err', '与板子失去连接，重试中…');
+  }
+  const now = performance.now();
+  rate = rate*0.8 + (1000/(now-lastTime))*0.2; lastTime = now;
+  document.getElementById('rateText').textContent = rate.toFixed(1) + ' Hz';
+}
+/* live camera: preload into an off-DOM Image so the visible one never blanks */
+const camImg = document.getElementById('camImg');
+let camBusy = false;
+function refreshCam(){
+  if(camBusy) return;
+  camBusy = true;
+  const pre = new Image();
+  pre.onload  = () => { camImg.src = pre.src; camBusy = false; };
+  pre.onerror = () => { camBusy = false; };
+  pre.src = '/shot?t=' + Date.now();
+  setTimeout(() => { camBusy = false; }, 4000);   /* never get stuck on a lost response */
+}
+
+buildCards();
+window.addEventListener('resize', renderCharts);
+setInterval(tick, 500);
+setInterval(refreshCam, 250);
+tick();
+refreshCam();
+</script>
+</body>
+</html>

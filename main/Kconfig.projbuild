@@ -1,0 +1,21 @@
+menu "Sensor Dashboard Configuration"
+
+    config SENSOR_DASH_WIFI_SSID
+        string "Wi-Fi SSID (2.4 GHz only)"
+        default "YOUR_2.4G_SSID"
+        help
+            ESP32-S3 has no 5 GHz radio - the AP must be available on 2.4 GHz.
+            Set it with `idf.py menuconfig` or in your (git-ignored) sdkconfig.
+            Never commit real credentials: sdkconfig is excluded via .gitignore.
+
+    config SENSOR_DASH_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default "YOUR_WIFI_PASSWORD"
+
+    config SENSOR_DASH_INTERVAL_MS
+        int "Sampling / report interval (ms)"
+        default 500
+        help
+            How often the board prints one JSON line with the sensor readings.
+
+endmenu

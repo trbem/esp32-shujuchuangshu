@@ -157,6 +157,24 @@ New-NetFirewallRule -DisplayName "ESP32 Telemetry 8080" -Direction Inbound -Acti
 真实密钥只保存在 git-ignore 的 `sdkconfig` 和 `server/.env`，不要提交。分区表已改为 2 MB 应用
 和 6080 KB 遥测队列，烧录本版本会覆盖板上原有分区表与 Flash 数据。
 
+### 刷新历史与按需采集
+
+电脑端页面的两个操作含义不同：
+
+| 操作 | 是否访问设备 | 数据含义 |
+|---|---:|---|
+| 刷新已存数据 | 否 | 只查询 SQLite，可能是旧观测 |
+| 采集一次最新数据 | 是 | 创建 UUID `request_id` 任务，板端回执后重新生成完整快照 |
+
+按需任务目标是页面选择的 `device_id`（默认 `s3eye-001`），传感源为温度、内存、IMU、Wi-Fi、
+摄像头和 LCD 统计。状态依次为 `submitted`、`received`、`completed`；板端报告错误为 `failed`，
+30 秒内未完成为 `timeout`。结果写入 SQLite 后会带 `source=on_demand` 和对应的 `request_id`，可追踪
+到唯一任务。
+
+服务端的“暂停周期遥测入库”仅丢弃周期遥测记录，**不会**停止板端每秒任务轮询、回执或按需结果入库，
+因此可用于课堂验证按钮触发而非周期上报。任务轮询间隔可在 menuconfig 中通过
+`On-demand capture task poll interval` 调整。
+
 ## 目录结构
 
 ```

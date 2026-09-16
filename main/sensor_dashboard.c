@@ -202,6 +202,9 @@ static size_t s_queue_depth;
 static uint32_t s_queue_dropped;
 static bool s_upload_ok;
 static int64_t s_last_upload_ms;
+static char s_active_task_id[37];
+static bool s_task_result_pending;
+static telemetry_snapshot_t s_task_result_sample;
 
 /* QMA6100P accelerometer, driven by the official Espressif component
  * (espressif/qma6100p) - the same driver model the display_rotation example uses.
@@ -956,6 +959,134 @@ static void telemetry_upload_task(void *arg)
     }
 }
 
+/* -------------------- On-demand capture tasks -------------------- */
+
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;
+} task_http_response_t;
+
+static esp_err_t task_http_event(esp_http_client_event_t *event)
+{
+    task_http_response_t *response = event->user_data;
+    if (event->event_id == HTTP_EVENT_ON_DATA && response && event->data_len > 0) {
+        size_t room = response->cap > response->len ? response->cap - response->len - 1 : 0;
+        size_t take = (size_t)event->data_len < room ? (size_t)event->data_len : room;
+        if (take) {
+            memcpy(response->buf + response->len, event->data, take);
+            response->len += take;
+            response->buf[response->len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+static void task_url(char *out, size_t out_len, const char *path)
+{
+    const char *api = strstr(CONFIG_SENSOR_DASH_COLLECTOR_URL, "/api/v1/");
+    size_t base_len = api ? (size_t)(api - CONFIG_SENSOR_DASH_COLLECTOR_URL)
+                          : strlen(CONFIG_SENSOR_DASH_COLLECTOR_URL);
+    snprintf(out, out_len, "%.*s%s", (int)base_len, CONFIG_SENSOR_DASH_COLLECTOR_URL, path);
+}
+
+static bool task_http_request(const char *url, esp_http_client_method_t method, const char *body,
+                              char *response_buf, size_t response_len)
+{
+    task_http_response_t response = {.buf = response_buf, .cap = response_len, .len = 0};
+    if (response_buf && response_len) response_buf[0] = '\0';
+    esp_http_client_config_t config = {.url = url, .method = method, .timeout_ms = 5000,
+                                       .event_handler = task_http_event, .user_data = &response};
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) return false;
+    esp_http_client_set_header(client, "X-Api-Key", CONFIG_SENSOR_DASH_COLLECTOR_API_KEY);
+    if (body) {
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, body, strlen(body));
+    }
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    return err == ESP_OK && status >= 200 && status < 300;
+}
+
+static bool task_post_ack(const char *request_id)
+{
+    char url[192], body[112];
+    task_url(url, sizeof(url), "/api/v1/capture-tasks/");
+    size_t used = strlen(url);
+    snprintf(url + used, sizeof(url) - used, "%s/ack", request_id);
+    snprintf(body, sizeof(body), "{\"device_id\":\"%s\"}", CONFIG_SENSOR_DASH_DEVICE_ID);
+    return task_http_request(url, HTTP_METHOD_POST, body, NULL, 0);
+}
+
+static bool task_post_result(const char *request_id, const telemetry_snapshot_t *s)
+{
+    char url[192];
+    task_url(url, sizeof(url), "/api/v1/capture-tasks/");
+    size_t url_used = strlen(url);
+    snprintf(url + url_used, sizeof(url) - url_used, "%s/result", request_id);
+    char *body = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!body) body = malloc(4096);
+    if (!body) return false;
+    uint32_t sequence = ++s_sample_sequence;
+    int written = snprintf(body, 4096,
+        "{\"device_id\":\"%s\",\"sample\":{\"boot_id\":\"%016" PRIx64
+        "\",\"sequence\":%" PRIu32 ",\"captured_at_ms\":%" PRId64
+        ",\"temp_c\":%.2f,\"heap_int\":%" PRIu32 ",\"heap_psram\":%" PRIu32
+        ",\"fps\":%.2f,\"jpeg\":%" PRIu32 ",\"accel_ok\":%s,\"accel_x_g\":%.4f"
+        ",\"accel_y_g\":%.4f,\"accel_z_g\":%.4f,\"accel_mag_g\":%.4f"
+        ",\"accel_range_g\":4,\"accel_id\":\"0x%02X\",\"accel_chip\":\"%s\""
+        ",\"uptime_s\":%" PRIu32 ",\"cpu_mhz\":%" PRIu32 ",\"rssi\":%" PRId32
+        ",\"ip\":\"%s\",\"lcd_frames\":%" PRIu32 ",\"lcd_fps\":%.2f,\"lcd_err\":%" PRIu32 "}}",
+        CONFIG_SENSOR_DASH_DEVICE_ID, s_boot_id, sequence, s->captured_at_ms, s->temp_c,
+        s->heap_int, s->heap_psram, s->fps, s->jpeg, s->accel_ok ? "true" : "false",
+        s->accel_x_g, s->accel_y_g, s->accel_z_g, s->accel_mag_g, s->accel_id,
+        qma_chip_name(s->accel_id), s->uptime_s, s->cpu_mhz, s->rssi, s->ip,
+        s->lcd_frames, s->lcd_fps, s->lcd_err);
+    bool ok = written > 0 && written < 4096 && task_http_request(url, HTTP_METHOD_POST, body, NULL, 0);
+    free(body);
+    return ok;
+}
+
+static void capture_task_poll_task(void *arg)
+{
+    const TickType_t delay = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_TASK_POLL_INTERVAL_MS);
+    while (true) {
+        vTaskDelay(delay);
+        if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT)) continue;
+        if (s_task_result_pending) {
+            if (task_post_result(s_active_task_id, &s_task_result_sample)) {
+                s_task_result_pending = false;
+                s_active_task_id[0] = '\0';
+            }
+            continue;
+        }
+        char path[128], url[192], response[512];
+        snprintf(path, sizeof(path), "/api/v1/devices/%s/tasks/next", CONFIG_SENSOR_DASH_DEVICE_ID);
+        task_url(url, sizeof(url), path);
+        if (!task_http_request(url, HTTP_METHOD_GET, NULL, response, sizeof(response))) continue;
+        const char *marker = strstr(response, "\"request_id\":\"");
+        if (!marker || strlen(marker + 14) < 37 || marker[14 + 36] != '\"') continue;
+        strncpy(s_active_task_id, marker + 14, sizeof(s_active_task_id) - 1);
+        s_active_task_id[sizeof(s_active_task_id) - 1] = '\0';
+        if (!task_post_ack(s_active_task_id)) continue;
+
+        /* The metrics loop refreshes s_latest_sample every 500 ms.  Waiting one
+         * interval after the receipt guarantees this task returns a new source
+         * read, rather than a snapshot that pre-dates its request_id. */
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_SENSOR_DASH_INTERVAL_MS + 100));
+        xSemaphoreTake(s_tlm_lock, portMAX_DELAY);
+        s_task_result_sample = s_latest_sample;
+        xSemaphoreGive(s_tlm_lock);
+        s_task_result_pending = true;
+        if (task_post_result(s_active_task_id, &s_task_result_sample)) {
+            s_task_result_pending = false;
+            s_active_task_id[0] = '\0';
+        }
+    }
+}
+
 /* ---------------------- HTTP handlers ---------------------- */
 
 static esp_err_t index_handler(httpd_req_t *req)
@@ -1177,6 +1308,9 @@ void app_main(void)
     start_mdns();
     if (xTaskCreate(telemetry_upload_task, "telemetry_upload", 8192, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "telemetry_upload task creation failed - nothing will reach the collector");
+    }
+    if (xTaskCreate(capture_task_poll_task, "capture_task_poll", 8192, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "capture_task_poll task creation failed - on-demand capture unavailable");
     }
 
     const TickType_t interval = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_INTERVAL_MS);

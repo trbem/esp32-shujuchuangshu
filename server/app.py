@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -64,6 +65,26 @@ class TelemetryBatch(BaseModel):
     samples: list[TelemetrySample] = Field(min_length=1, max_length=20)
 
 
+class CaptureTaskCreate(BaseModel):
+    device_id: str = Field(min_length=1, max_length=64)
+
+
+class TaskAck(BaseModel):
+    device_id: str = Field(min_length=1, max_length=64)
+
+
+class TaskResult(TaskAck):
+    sample: TelemetrySample
+
+
+class TaskFailure(TaskAck):
+    error: str = Field(min_length=1, max_length=240)
+
+
+class PeriodicIngestionControl(BaseModel):
+    paused: bool
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS telemetry (
   id INTEGER PRIMARY KEY,
@@ -78,9 +99,25 @@ CREATE TABLE IF NOT EXISTS telemetry (
   accel_mag_g REAL NOT NULL, accel_range_g INTEGER NOT NULL, accel_id TEXT NOT NULL, accel_chip TEXT NOT NULL,
   uptime_s INTEGER NOT NULL, cpu_mhz INTEGER NOT NULL, rssi INTEGER NOT NULL, ip TEXT NOT NULL,
   lcd_frames INTEGER NOT NULL DEFAULT 0, lcd_fps REAL NOT NULL DEFAULT 0, lcd_err INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'periodic', request_id TEXT,
   UNIQUE(device_id, boot_id, sequence)
 );
 CREATE INDEX IF NOT EXISTS telemetry_time_idx ON telemetry(device_id, captured_at_ms DESC);
+CREATE TABLE IF NOT EXISTS devices (
+  device_id TEXT PRIMARY KEY, last_seen_at_ms INTEGER NOT NULL, last_ip TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS service_settings (
+  name TEXT PRIMARY KEY, value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS capture_tasks (
+  request_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, task_type TEXT NOT NULL,
+  sensor_sources TEXT NOT NULL, status TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL,
+  received_at_ms INTEGER, completed_at_ms INTEGER, failed_at_ms INTEGER,
+  error TEXT, telemetry_id INTEGER,
+  FOREIGN KEY(telemetry_id) REFERENCES telemetry(id)
+);
+CREATE INDEX IF NOT EXISTS capture_tasks_status_idx ON capture_tasks(device_id, status, created_at_ms);
 """
 
 # Columns added after the first release.  CREATE TABLE IF NOT EXISTS leaves an
@@ -92,6 +129,8 @@ ADDED_COLUMNS = {
     "lcd_frames": "INTEGER NOT NULL DEFAULT 0",
     "lcd_fps": "REAL NOT NULL DEFAULT 0",
     "lcd_err": "INTEGER NOT NULL DEFAULT 0",
+    "source": "TEXT NOT NULL DEFAULT 'periodic'",
+    "request_id": "TEXT",
 }
 
 
@@ -111,6 +150,7 @@ class Store:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
             add_missing_columns(conn)
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_request_idx ON telemetry(request_id)")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
         self.cleanup(force=True)
@@ -143,7 +183,8 @@ class Store:
                 )
             self._last_cleanup = now
 
-    def insert_batch(self, batch: TelemetryBatch) -> int:
+    def _insert_rows(self, conn: sqlite3.Connection, batch: TelemetryBatch, source: str = "periodic",
+                     request_id: str | None = None) -> list[int]:
         received_at_ms = int(time.time() * 1000)
         rows = [
             (
@@ -151,7 +192,7 @@ class Store:
                 s.temp_c, s.heap_int, s.heap_psram, s.fps, s.jpeg, int(s.accel_ok),
                 s.accel_x_g, s.accel_y_g, s.accel_z_g, s.accel_mag_g, s.accel_range_g,
                 s.accel_id, s.accel_chip or {"0x90": "QMA6100P", "0xE7": "QMA7981"}.get(s.accel_id, "Unknown"),
-                s.uptime_s, s.cpu_mhz, s.rssi, s.ip, s.lcd_frames, s.lcd_fps, s.lcd_err,
+                s.uptime_s, s.cpu_mhz, s.rssi, s.ip, s.lcd_frames, s.lcd_fps, s.lcd_err, source, request_id,
             )
             for s in batch.samples
         ]
@@ -160,13 +201,117 @@ class Store:
               device_id, boot_id, sequence, captured_at_ms, received_at_ms,
               temp_c, heap_int, heap_psram, fps, jpeg, accel_ok,
               accel_x_g, accel_y_g, accel_z_g, accel_mag_g, accel_range_g,
-              accel_id, accel_chip, uptime_s, cpu_mhz, rssi, ip, lcd_frames, lcd_fps, lcd_err
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              accel_id, accel_chip, uptime_s, cpu_mhz, rssi, ip, lcd_frames, lcd_fps, lcd_err, source, request_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
+        ids = []
+        for row in rows:
+            conn.execute(sql, row)
+            found = conn.execute("SELECT id FROM telemetry WHERE device_id=? AND boot_id=? AND sequence=?",
+                                 row[:3]).fetchone()
+            if found:
+                ids.append(found[0])
+        return ids
+
+    @staticmethod
+    def _upsert_device(conn: sqlite3.Connection, device_id: str, ip: str) -> None:
+        conn.execute("INSERT INTO devices(device_id,last_seen_at_ms,last_ip) VALUES(?,?,?) "
+                     "ON CONFLICT(device_id) DO UPDATE SET last_seen_at_ms=excluded.last_seen_at_ms,last_ip=excluded.last_ip",
+                     (device_id, int(time.time() * 1000), ip))
+
+    def periodic_paused(self, conn: sqlite3.Connection) -> bool:
+        row = conn.execute("SELECT value FROM service_settings WHERE name='periodic_ingestion_paused'").fetchone()
+        return row is not None and row[0] == "1"
+
+    def set_periodic_paused(self, paused: bool) -> None:
         with self.connect() as conn:
+            conn.execute("INSERT INTO service_settings(name,value) VALUES('periodic_ingestion_paused',?) "
+                         "ON CONFLICT(name) DO UPDATE SET value=excluded.value", ("1" if paused else "0",))
+
+    def insert_batch(self, batch: TelemetryBatch) -> int:
+        with self.connect() as conn:
+            self._upsert_device(conn, batch.device_id, batch.samples[-1].ip)
+            if self.periodic_paused(conn):
+                return 0
             before = conn.total_changes
-            conn.executemany(sql, rows)
+            self._insert_rows(conn, batch)
             return conn.total_changes - before
+
+    @staticmethod
+    def _expire_tasks(conn: sqlite3.Connection) -> None:
+        now = int(time.time() * 1000)
+        conn.execute("UPDATE capture_tasks SET status='timeout', failed_at_ms=?, error='任务在 30 秒内未完成' "
+                     "WHERE status IN ('submitted','received') AND expires_at_ms <= ?", (now, now))
+
+    def create_task(self, device_id: str) -> dict:
+        now = int(time.time() * 1000)
+        task = {"request_id": str(uuid.uuid4()), "device_id": device_id,
+                "task_type": "capture_full_snapshot",
+                "sensor_sources": "temperature,heap,imu,wifi,camera,lcd",
+                "status": "submitted", "created_at_ms": now, "expires_at_ms": now + 30000}
+        with self.connect() as conn:
+            conn.execute("INSERT INTO capture_tasks(request_id,device_id,task_type,sensor_sources,status,created_at_ms,expires_at_ms) "
+                         "VALUES(:request_id,:device_id,:task_type,:sensor_sources,:status,:created_at_ms,:expires_at_ms)", task)
+        return task
+
+    def next_task(self, device_id: str) -> dict | None:
+        with self.connect() as conn:
+            self._expire_tasks(conn)
+            row = conn.execute("SELECT * FROM capture_tasks WHERE device_id=? AND status IN ('submitted','received') "
+                               "ORDER BY created_at_ms LIMIT 1", (device_id,)).fetchone()
+            return dict(row) if row else None
+
+    def ack_task(self, request_id: str, device_id: str) -> dict:
+        now = int(time.time() * 1000)
+        with self.connect() as conn:
+            self._expire_tasks(conn)
+            row = conn.execute("SELECT * FROM capture_tasks WHERE request_id=? AND device_id=?", (request_id, device_id)).fetchone()
+            if not row: raise KeyError("任务不存在或不属于该设备")
+            if row["status"] == "submitted":
+                conn.execute("UPDATE capture_tasks SET status='received', received_at_ms=? WHERE request_id=?", (now, request_id))
+            elif row["status"] not in ("received", "completed"):
+                raise ValueError(row["status"])
+            updated = conn.execute("SELECT * FROM capture_tasks WHERE request_id=?", (request_id,)).fetchone()
+            return dict(updated)
+
+    def complete_task(self, request_id: str, result: TaskResult) -> dict:
+        with self.connect() as conn:
+            self._expire_tasks(conn)
+            row = conn.execute("SELECT * FROM capture_tasks WHERE request_id=? AND device_id=?", (request_id, result.device_id)).fetchone()
+            if not row: raise KeyError("任务不存在或不属于该设备")
+            if row["status"] == "completed": return dict(row)
+            if row["status"] not in ("submitted", "received"): raise ValueError(row["status"])
+            batch = TelemetryBatch(device_id=result.device_id, samples=[result.sample])
+            self._upsert_device(conn, result.device_id, result.sample.ip)
+            telemetry_id = self._insert_rows(conn, batch, "on_demand", request_id)[0]
+            now = int(time.time() * 1000)
+            conn.execute("UPDATE capture_tasks SET status='completed', completed_at_ms=?, telemetry_id=? WHERE request_id=?",
+                         (now, telemetry_id, request_id))
+            return dict(conn.execute("SELECT * FROM capture_tasks WHERE request_id=?", (request_id,)).fetchone())
+
+    def fail_task(self, request_id: str, failure: TaskFailure) -> dict:
+        with self.connect() as conn:
+            self._expire_tasks(conn)
+            row = conn.execute("SELECT * FROM capture_tasks WHERE request_id=? AND device_id=?", (request_id, failure.device_id)).fetchone()
+            if not row: raise KeyError("任务不存在或不属于该设备")
+            if row["status"] in ("completed", "timeout"): raise ValueError(row["status"])
+            now = int(time.time() * 1000)
+            conn.execute("UPDATE capture_tasks SET status='failed', failed_at_ms=?, error=? WHERE request_id=?",
+                         (now, failure.error, request_id))
+            return dict(conn.execute("SELECT * FROM capture_tasks WHERE request_id=?", (request_id,)).fetchone())
+
+    def list_tasks(self, device_id: str | None = None) -> list[dict]:
+        with self.connect() as conn:
+            self._expire_tasks(conn)
+            if device_id:
+                rows = conn.execute("SELECT * FROM capture_tasks WHERE device_id=? ORDER BY created_at_ms DESC LIMIT 100", (device_id,))
+            else:
+                rows = conn.execute("SELECT * FROM capture_tasks ORDER BY created_at_ms DESC LIMIT 100")
+            return [dict(row) for row in rows]
+
+    def list_devices(self) -> list[dict]:
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM devices ORDER BY last_seen_at_ms DESC")]
 
     def query(self, start_ms: int | None, end_ms: int | None, device_id: str | None, limit: int):
         where, values = [], []
@@ -202,6 +347,66 @@ def create_app(database: Path | None = None, api_key: str | None = None) -> Fast
         store.cleanup()
         inserted = store.insert_batch(batch)
         return {"accepted": len(batch.samples), "inserted": inserted}
+
+    @app.get("/api/v1/devices")
+    def get_devices():
+        return {"devices": store.list_devices()}
+
+    @app.post("/api/v1/capture-tasks", status_code=201)
+    def create_capture_task(request: CaptureTaskCreate):
+        return store.create_task(request.device_id)
+
+    @app.get("/api/v1/capture-tasks")
+    def get_capture_tasks(device_id: str | None = None):
+        return {"tasks": store.list_tasks(device_id)}
+
+    @app.get("/api/v1/capture-tasks/{request_id}")
+    def get_capture_task(request_id: str):
+        for task in store.list_tasks():
+            if task["request_id"] == request_id:
+                return task
+        raise HTTPException(status_code=404, detail="task not found")
+
+    @app.get("/api/v1/devices/{device_id}/tasks/next")
+    def get_next_task(device_id: str, _: None = Depends(require_api_key)):
+        return {"task": store.next_task(device_id)}
+
+    @app.post("/api/v1/capture-tasks/{request_id}/ack")
+    def acknowledge_capture_task(request_id: str, ack: TaskAck, _: None = Depends(require_api_key)):
+        try:
+            return store.ack_task(request_id, ack.device_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=f"task is {exc}") from exc
+
+    @app.post("/api/v1/capture-tasks/{request_id}/result")
+    def complete_capture_task(request_id: str, result: TaskResult, _: None = Depends(require_api_key)):
+        try:
+            return store.complete_task(request_id, result)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=f"task is {exc}") from exc
+
+    @app.post("/api/v1/capture-tasks/{request_id}/fail")
+    def fail_capture_task(request_id: str, failure: TaskFailure, _: None = Depends(require_api_key)):
+        try:
+            return store.fail_task(request_id, failure)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=f"task is {exc}") from exc
+
+    @app.get("/api/v1/control/periodic-ingestion")
+    def get_periodic_ingestion_state():
+        with store.connect() as conn:
+            return {"paused": store.periodic_paused(conn)}
+
+    @app.put("/api/v1/control/periodic-ingestion")
+    def set_periodic_ingestion_state(control: PeriodicIngestionControl):
+        store.set_periodic_paused(control.paused)
+        return {"paused": control.paused}
 
     @app.get("/api/v1/telemetry")
     def get_telemetry(

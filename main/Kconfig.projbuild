@@ -42,4 +42,12 @@ menu "Sensor Dashboard Configuration"
         help
             A current sensor snapshot is appended to Flash and uploaded at this interval.
 
+    config SENSOR_DASH_TASK_POLL_INTERVAL_MS
+        int "On-demand capture task poll interval (ms)"
+        default 1000
+        range 500 10000
+        help
+            How often the board asks the collector for a capture_full_snapshot task.
+            This continues even when the server pauses periodic telemetry storage.
+
 endmenu

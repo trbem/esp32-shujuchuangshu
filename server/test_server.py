@@ -41,7 +41,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/v1/telemetry', json=self.payload, headers=headers).json()["inserted"], 0)
         self.assertEqual(len(self.client.get('/api/v1/telemetry').json()["samples"]), 1)
         self.assertIn('temp_c', self.client.get('/api/v1/export.csv').text)
-        self.assertIn('ESP32 遥测历史', self.client.get('/').text)
+        self.assertIn('<title>ESP32', self.client.get('/').text)
 
     def test_lcd_counters_are_optional_and_persisted(self):
         """Older firmware omits lcd_frames/lcd_fps; newer firmware sends them.
@@ -97,6 +97,39 @@ class ServerTests(unittest.TestCase):
         self.assertIn("lcd_frames", cols)
         self.assertIn("lcd_fps", cols)
         self.assertIn("lcd_err", cols)
+
+    def test_on_demand_task_ack_result_and_periodic_pause(self):
+        headers = {"X-Api-Key": "test-key"}
+        # Repeated clicks intentionally create distinct tasks.
+        first = self.client.post("/api/v1/capture-tasks", json={"device_id": "s3eye-001"}).json()
+        second = self.client.post("/api/v1/capture-tasks", json={"device_id": "s3eye-001"}).json()
+        self.assertNotEqual(first["request_id"], second["request_id"])
+        next_task = self.client.get("/api/v1/devices/s3eye-001/tasks/next", headers=headers).json()["task"]
+        self.assertEqual(next_task["request_id"], first["request_id"])
+        self.assertEqual(self.client.post(f"/api/v1/capture-tasks/{first['request_id']}/ack",
+                                          headers=headers, json={"device_id": "s3eye-001"}).json()["status"], "received")
+        result = {"device_id": "s3eye-001", "sample": dict(self.payload["samples"][0])}
+        result["sample"]["sequence"] = 99
+        finished = self.client.post(f"/api/v1/capture-tasks/{first['request_id']}/result",
+                                    headers=headers, json=result).json()
+        self.assertEqual(finished["status"], "completed")
+        self.assertIsNotNone(finished["telemetry_id"])
+        self.assertEqual(self.query("SELECT source, request_id FROM telemetry WHERE id=%d" % finished["telemetry_id"])[0],
+                         ("on_demand", first["request_id"]))
+        self.assertEqual(self.client.put("/api/v1/control/periodic-ingestion", json={"paused": True}).json(), {"paused": True})
+        self.assertEqual(self.client.post('/api/v1/telemetry', json=self.payload, headers=headers).json()["inserted"], 0)
+
+    def test_unreceived_task_times_out(self):
+        task = self.client.post("/api/v1/capture-tasks", json={"device_id": "offline-device"}).json()
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE capture_tasks SET expires_at_ms=0 WHERE request_id=?", (task["request_id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        tasks = self.client.get("/api/v1/capture-tasks").json()["tasks"]
+        expired = next(t for t in tasks if t["request_id"] == task["request_id"])
+        self.assertEqual(expired["status"], "timeout")
 
 
 if __name__ == '__main__': unittest.main()

@@ -4,13 +4,24 @@
  * The board joins a 2.4 GHz Wi-Fi network, starts an HTTP server and serves:
  *   GET /       -> the dashboard page (embedded dashboard.html)
  *   GET /data   -> one JSON sample: {"temp_c":..,"heap_int":..,"heap_psram":..,
- *                                    "fps":..,"luma":..,"uptime_s":..,"rssi":..}
+ *                                    "fps":..,"accel_x_g":..,"uptime_s":..,"rssi":..}
+ *   GET /shot   -> the current viewfinder frame as an uncompressed 24-bit BMP
  *
- * The same JSON line is also printed on the USB Serial/JTAG console for debugging.
+ * The OV2640 is captured as raw RGB565 at 240x240 and pushed straight to the
+ * on-board ST7789, so the panel shows a live 25 fps viewfinder.  /shot hands the
+ * same frame to the browser as a BMP, which every <img> renders natively.
+ *
+ * Samples are also journalled to the "telemetry" Flash partition and uploaded to
+ * the collector configured in menuconfig; the same JSON line is printed on the
+ * USB Serial/JTAG console for debugging.
  */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
+#include <sys/time.h>
+#include <inttypes.h>
+#include <stddef.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,10 +33,14 @@
 #include "esp_private/esp_clk.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_partition.h"
+#include "esp_netif_sntp.h"
 #include "esp_cache.h"
 #include "mdns.h"
 #include "driver/temperature_sensor.h"
@@ -35,6 +50,11 @@
 #include "hal/cam_ctlr_types.h"
 #include "example_sensor_init.h"
 #include "qma6100p.h"
+#include "driver/spi_master.h"
+#include "driver/ledc.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
 
 static const char *TAG = "sensor_dash";
 
@@ -55,16 +75,45 @@ static const char *TAG = "sensor_dash";
 #define CAM_D7_IO           (16)
 #define CAM_XCLK_FREQ_HZ    (20000000)
 #define CAM_DATA_WIDTH      (8)
-#define CAM_BYTES_PER_PIXEL (2)     /* RGB565 */
 
-/* OV2640: hardware JPEG, 320x240, 20 MHz input clock.
- * The DVP controller scans for the JPEG EOI marker and reports the real frame
- * length in trans->received_size, so the buffers only need to hold the worst
- * case (h_res * v_res bytes). */
-#define CAM_FORMAT_NAME     "DVP_8bit_20Minput_JPEG_320x240_50fps"
-#define CAM_JPEG_W          (320)
-#define CAM_JPEG_H          (240)
-#define CAM_FRAME_MAX       ((size_t)CAM_JPEG_W * CAM_JPEG_H)
+/* ------------- ESP32-S3-EYE ST7789 LCD (SPI3) ------------- */
+#define LCD_SPI_HOST            (SPI3_HOST)
+#define LCD_SPI_MOSI_IO         (47)
+#define LCD_SPI_CLK_IO          (21)
+#define LCD_SPI_CS_IO           (44)
+#define LCD_DC_IO               (43)
+#define LCD_RST_IO              (GPIO_NUM_NC)   /* the panel is reset by the RC on-board */
+#define LCD_BACKLIGHT_IO        (48)
+#define LCD_PIXEL_CLOCK_HZ      (80 * 1000 * 1000)
+#define LCD_CMD_BITS            (8)
+#define LCD_PARAM_BITS          (8)
+/* The camera peripheral drives XCLK from its own clock divider, so the backlight
+ * is free to use LEDC timer 1 without fighting the DVP controller for timer 0. */
+#define LCD_BL_LEDC_TIMER       (LEDC_TIMER_1)
+#define LCD_BL_LEDC_CHANNEL     (LEDC_CHANNEL_0)
+
+/* ------------- capture format ------------- */
+/* The DVP controller can only run one capture format at a time.  We now capture
+ * raw RGB565 at the panel's native 240x240 so the LCD gets a smooth 25 fps
+ * viewfinder; the web snapshot is produced on demand by the S3 hardware JPEG
+ * encoder from the very same frame (see shot_handler), so /shot still returns a
+ * real JPEG without a second capture pipeline. */
+#define CAM_FORMAT_NAME     "DVP_8bit_20Minput_RGB565_240x240_25fps"
+#define CAM_LCD_W           (240)
+#define CAM_LCD_H           (240)
+#define CAM_BYTES_PER_PIXEL (2)     /* RGB565 */
+#define CAM_FRAME_MAX       ((size_t)CAM_LCD_W * CAM_LCD_H * CAM_BYTES_PER_PIXEL)
+
+/* Largest single SPI transfer the LCD bus will be asked for.  It also sets the
+ * size of the internal-RAM bounce buffer the SPI driver needs per transfer, so
+ * it is intentionally far smaller than a whole frame - see lcd_init(). */
+#define LCD_SPI_CHUNK_BYTES (4 * 1024)
+/* How many chunk transfers may be in flight at once.  Each one holds its own
+ * internal-RAM bounce buffer, so the peak internal-RAM cost of the viewfinder
+ * is roughly LCD_SPI_CHUNK_BYTES * LCD_SPI_QUEUE_DEPTH - keep that well under
+ * 32 KB, because Wi-Fi already holds a large share of internal DMA RAM and the
+ * bounce buffer allocation is what fails first when it runs out. */
+#define LCD_SPI_QUEUE_DEPTH (4)
 
 /* Embedded dashboard page (see EMBED_TXTFILES in CMakeLists.txt) */
 extern const char _binary_dashboard_html_start[];
@@ -79,6 +128,81 @@ static char s_json[768] = "{\"ready\":false}";
 static char s_ip[16] = "";
 static int  s_rssi = 0;
 
+/* The Flash journal is deliberately independent from NVS: each record has a
+ * CRC and an acknowledged bit, so a reset while writing or uploading can be
+ * recovered by scanning the telemetry partition. */
+#define TLM_MAGIC              0x544C4D31UL /* TLM1 */
+#define TLM_VERSION            1
+#define TLM_STATE_PENDING      0xFEU
+#define TLM_STATE_ACKED        0xFCU
+#define TLM_RECORD_SIZE        128U
+#define TLM_BATCH_MAX          20U
+#define TLM_SECTOR_SIZE        4096U
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t state;
+    uint8_t version;
+    uint16_t reserved0;
+    uint64_t boot_id;
+    uint32_t sequence;
+    int64_t captured_at_ms;
+    float temp_c;
+    uint32_t heap_int;
+    uint32_t heap_psram;
+    float fps;
+    uint32_t jpeg;
+    uint32_t accel_ok;
+    float accel_x_g;
+    float accel_y_g;
+    float accel_z_g;
+    float accel_mag_g;
+    uint32_t accel_range_g;
+    uint8_t accel_id;
+    uint8_t reserved1[3];
+    uint32_t uptime_s;
+    uint32_t cpu_mhz;
+    int32_t rssi;
+    char ip[16];
+    uint32_t crc32;
+    /* Carved out of what used to be padding: no field moves, so records written
+     * by an earlier build still parse - their zeroed padding reads back as
+     * lcd_frames = 0, which is exactly right for a build without the LCD. */
+    uint32_t lcd_frames;
+    float lcd_fps;
+    uint32_t lcd_err;
+    uint8_t padding[TLM_RECORD_SIZE - 120U];
+} telemetry_record_t;
+
+typedef struct {
+    float temp_c;
+    uint32_t heap_int, heap_psram;
+    float fps;
+    uint32_t jpeg;
+    bool accel_ok;
+    float accel_x_g, accel_y_g, accel_z_g, accel_mag_g;
+    uint8_t accel_id;
+    uint32_t uptime_s, cpu_mhz;
+    int32_t rssi;
+    int64_t captured_at_ms;
+    uint32_t lcd_frames;
+    float lcd_fps;
+    uint32_t lcd_err;
+    char ip[16];
+} telemetry_snapshot_t;
+
+static const esp_partition_t *s_tlm_partition;
+static SemaphoreHandle_t s_tlm_lock;
+static telemetry_snapshot_t s_latest_sample;
+static uint64_t s_boot_id;
+static uint32_t s_sample_sequence;
+static size_t s_queue_write_slot;
+static size_t s_queue_slots;
+static size_t s_queue_depth;
+static uint32_t s_queue_dropped;
+static bool s_upload_ok;
+static int64_t s_last_upload_ms;
+
 /* QMA6100P accelerometer, driven by the official Espressif component
  * (espressif/qma6100p) - the same driver model the display_rotation example uses.
  * The OV2640 SCCB and the QMA share the camera's I2C0 bus (GPIO4 / GPIO5). */
@@ -87,19 +211,46 @@ static bool s_qma_available = false;
 static uint8_t s_qma_id = 0;      /* WHO_AM_I (register 0x00) read at init */
 static uint8_t s_qma_addr = 0;    /* 0x12 or 0x13, whichever answered */
 
-/* Two buffers so the HTTP server can send one frame while the camera fills the
- * other one - otherwise /shot would regularly return a half-written JPEG. */
+/* Two buffers so the LCD / the JPEG encoder can consume one frame while the
+ * camera fills the other one - otherwise a transfer would regularly read a
+ * half-written frame. */
 typedef struct {
     uint8_t  *buf[2];
     size_t    len[2];
     size_t    buf_size;
     volatile int       writing;   /* buffer the DMA is currently filling */
     volatile int       ready;     /* buffer holding the last complete frame, -1 = none */
-    volatile int       lock;      /* buffer reserved by the HTTP handler, -1 = none */
-    volatile uint32_t  frame_count;
+    volatile int       lock;      /* buffer reserved by a consumer, -1 = none */
+    volatile uint32_t  frame_count; /* reset by the metrics loop to derive fps */
+    volatile uint32_t  ready_seq;   /* never reset; lets the LCD task spot new frames */
 } cam_ctx_t;
 
 static cam_ctx_t s_cam_ctx = {0};
+
+/* ST7789 viewfinder panel + the BMP snapshot buffer that backs /shot.
+ *
+ * The ESP32-S3 has no hardware JPEG *encoder* (only the P4 does) and the ROM
+ * only carries tjpgd for decoding, so instead of compressing we hand the browser
+ * the frame as an uncompressed 24-bit BMP - every browser renders it natively
+ * through a plain <img>, so the dashboard needs no JavaScript changes. */
+static esp_lcd_panel_handle_t s_lcd_panel = NULL;
+static uint8_t               *s_shot_bmp = NULL;
+
+/* Monotonic count of frames actually shifted into the panel.  The SPI panel IO
+ * raises on_color_trans_done once per whole frame (after every chunk of a split
+ * transfer has gone out), which is the only hard evidence that the viewfinder
+ * path is alive when nobody is looking at the screen.  The metrics loop turns
+ * the delta into lcd_fps. */
+static volatile uint32_t s_lcd_frames = 0;
+static uint32_t          s_lcd_frames_last = 0;
+/* Dropped pushes.  Kept because esp_lcd_panel_draw_bitmap() failing is silent
+ * at the application level - the only other symptom is the frame counter going
+ * flat, which is easy to miss. */
+static volatile uint32_t s_lcd_errors = 0;
+
+#define SHOT_BMP_HEADER_SIZE  (54U)                                     /* 14 + 40 */
+#define SHOT_BMP_PIXELS       ((size_t)CAM_LCD_W * CAM_LCD_H * 3U)      /* BGR888  */
+#define SHOT_BMP_SIZE         (SHOT_BMP_HEADER_SIZE + SHOT_BMP_PIXELS)
 
 /* ------------------------- helpers ------------------------- */
 
@@ -117,43 +268,172 @@ static bool s_camera_get_new_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_tr
     return false;
 }
 
-/* The current IDF v6.0.3 DVP driver can occasionally report received_size=0
- * for OV2640 JPEG although the JPEG bytes are present in PSRAM.  Re-sync the
- * complete DMA buffer and recover the frame boundary from the JPEG EOI marker.
- * This runs in ISR context; the driver itself uses esp_cache_msync here too. */
-static size_t IRAM_ATTR jpeg_size_from_eoi(const uint8_t *buf, size_t max_len)
-{
-    if (buf == NULL || max_len < 4 || buf[0] != 0xFF || buf[1] != 0xD8) {
-        return 0;
-    }
-    for (size_t off = max_len - 2; off > 2; off--) {
-        if (buf[off] == 0xFF && buf[off + 1] == 0xD9) {
-            return off + 2;
-        }
-    }
-    return 0;
-}
-
-/* Runs in ISR context: record where the finished frame landed. */
+/* Runs in ISR context: record where the finished frame landed.  A raw RGB565
+ * frame is always the whole buffer, so a reported size of 0 just means the
+ * driver did not fill the field in - it never means "half a frame" here. */
 static bool s_camera_get_finished_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data)
 {
     cam_ctx_t *ctx = (cam_ctx_t *)user_data;
     int idx = (trans->buffer == ctx->buf[0]) ? 0 : 1;
     size_t n = trans->received_size;
 
-    if (n == 0) {
-        esp_cache_msync(trans->buffer, ctx->buf_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-        n = jpeg_size_from_eoi((const uint8_t *)trans->buffer, ctx->buf_size);
-    }
-    if (n > ctx->buf_size) {
+    if (n == 0 || n > ctx->buf_size) {
         n = ctx->buf_size;
     }
     ctx->len[idx] = n;
-    if (n > 0) {
-        ctx->ready = idx;
-    }
+    ctx->ready = idx;
+    ctx->ready_seq++;
     ctx->frame_count++;
     return false;
+}
+
+static uint32_t s_msync_errors = 0;
+
+/* The camera writes PSRAM through DMA while the LCD and the /shot handler read
+ * it back through the same cache.  Dropping the cached lines of a finished
+ * frame keeps the consumers from rendering a stale copy. */
+static inline void cam_frame_sync(const uint8_t *buf)
+{
+    esp_err_t err = esp_cache_msync((void *)buf, CAM_FRAME_MAX, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    if (err != ESP_OK) {
+        /* Called ~25x/s, so only the first few failures are worth printing -
+         * but they must not be swallowed: a failing sync means the LCD and
+         * /shot quietly render stale pixels, which is very hard to notice. */
+        if (++s_msync_errors <= 5) {
+            ESP_LOGW(TAG, "cache sync failed: %s (total %u)", esp_err_to_name(err),
+                     (unsigned)s_msync_errors);
+        }
+    }
+}
+
+/* Push finished frames to the ST7789.  This deliberately lives in a task rather
+ * than in the capture callback: esp_lcd_panel_draw_bitmap() queues an SPI
+ * transfer and is not meant to be called from interrupt context. */
+static void lcd_refresh_task(void *arg)
+{
+    uint32_t seen = 0;
+    while (true) {
+        uint32_t seq = s_cam_ctx.ready_seq;
+        int idx = s_cam_ctx.ready;
+        if (s_lcd_panel != NULL && idx >= 0 && seq != seen) {
+            seen = seq;
+            cam_frame_sync(s_cam_ctx.buf[idx]);
+            esp_err_t err = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, CAM_LCD_W, CAM_LCD_H,
+                                                      s_cam_ctx.buf[idx]);
+            if (err != ESP_OK) {
+                /* Do not burn the whole frame budget on retries: skip this frame
+                 * and try the next one.  If it keeps failing, the counter below
+                 * makes it visible in /data instead of just going quiet. */
+                uint32_t n = ++s_lcd_errors;
+                if (n <= 5 || (n % 250) == 0) {
+                    ESP_LOGW(TAG, "lcd draw failed: %s (total %u)", esp_err_to_name(err),
+                             (unsigned)n);
+                }
+            }
+        }
+        /* One whole tick, not pdMS_TO_TICKS(2): CONFIG_FREERTOS_HZ is 100, so a
+         * 2 ms delay rounds down to 0 and vTaskDelay(0) only yields to equal or
+         * higher priorities - which starves the idle task and trips the task
+         * watchdog.  A frame every 40 ms is picked up within one 10 ms tick. */
+        vTaskDelay(1);
+    }
+}
+
+/* ------------------------- ST7789 viewfinder ------------------------- */
+
+/* Runs in ISR context once the panel IO has finished a whole frame.  Only the
+ * counter is touched here: the LCD task owns everything else. */
+static bool lcd_on_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
+                                    esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    (void)panel_io;
+    (void)edata;
+    (void)user_ctx;
+    s_lcd_frames++;
+    return false;
+}
+
+static void lcd_init(void)
+{
+    const ledc_timer_config_t bl_timer = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num       = LCD_BL_LEDC_TIMER,
+        .freq_hz         = 5000,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&bl_timer));
+    const ledc_channel_config_t bl_channel = {
+        .gpio_num   = LCD_BACKLIGHT_IO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LCD_BL_LEDC_CHANNEL,
+        .timer_sel  = LCD_BL_LEDC_TIMER,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .duty       = 0,                    /* dark until the panel is configured */
+        .hpoint     = 0,
+        .flags.output_invert = true,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&bl_channel));
+
+    const spi_bus_config_t bus_cfg = {
+        .sclk_io_num     = LCD_SPI_CLK_IO,
+        .mosi_io_num     = LCD_SPI_MOSI_IO,
+        .miso_io_num     = GPIO_NUM_NC,
+        .quadwp_io_num   = GPIO_NUM_NC,
+        .quadhd_io_num   = GPIO_NUM_NC,
+        /* Deliberately NOT CAM_FRAME_MAX.  The frame buffers live in PSRAM, so
+         * for every transfer the SPI driver allocates a temporary internal-RAM
+         * bounce buffer of the chunk size, memcpy's into it, sends, then frees.
+         * With max_transfer_sz = 115200 that bounce buffer is a whole frame, and
+         * once internal RAM gets tight the allocation fails - the driver logs
+         * "Failed to allocate priv TX buffer", esp_lcd_panel_draw_bitmap()
+         * returns ESP_ERR_NO_MEM, and the viewfinder freezes for good (observed
+         * after ~4 min of uptime).  Keeping the chunk small means the bounce
+         * buffer is always trivially allocatable; the panel IO splits the frame
+         * into chunks of this size with CS held active.  The total memcpy per
+         * frame is the same either way.
+         *
+         * Do not "optimise" this by setting psram_dma_direct instead: SPI DMA
+         * straight out of PSRAM cannot keep up with the 80 MHz pixel clock and
+         * the driver dies with "DMA TX underflow detected", after which every
+         * later call fails with ESP_ERR_INVALID_STATE. */
+        .max_transfer_sz = LCD_SPI_CHUNK_BYTES,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+    const esp_lcd_panel_io_spi_config_t io_cfg = {
+        .dc_gpio_num       = LCD_DC_IO,
+        .cs_gpio_num       = LCD_SPI_CS_IO,
+        .pclk_hz           = LCD_PIXEL_CLOCK_HZ,
+        .lcd_cmd_bits      = LCD_CMD_BITS,
+        .lcd_param_bits    = LCD_PARAM_BITS,
+        .spi_mode          = 2,
+        .trans_queue_depth = LCD_SPI_QUEUE_DEPTH,
+    };
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_HOST, &io_cfg, &io_handle));
+
+    /* Must be installed before the first transfer - the driver refuses a second
+     * registration, and the panel init below already pushes parameters. */
+    const esp_lcd_panel_io_callbacks_t io_callbacks = {
+        .on_color_trans_done = lcd_on_color_trans_done,
+    };
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io_handle, &io_callbacks, NULL));
+
+    const esp_lcd_panel_dev_config_t panel_cfg = {
+        .reset_gpio_num = LCD_RST_IO,
+        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_cfg, &s_lcd_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_lcd_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_lcd_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_lcd_panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_lcd_panel, true));
+
+    const uint32_t duty = (1023 * 100) / 100;   /* 100 % backlight */
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LCD_BL_LEDC_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LCD_BL_LEDC_CHANNEL));
 }
 
 static esp_err_t camera_init(esp_cam_ctlr_handle_t *out_handle, i2c_master_bus_handle_t *out_i2c_bus)
@@ -175,9 +455,9 @@ static esp_err_t camera_init(esp_cam_ctlr_handle_t *out_handle, i2c_master_bus_h
     esp_cam_ctlr_dvp_config_t dvp_config = {
         .ctlr_id = 0,
         .clk_src = CAM_CLK_SRC_DEFAULT,
-        .h_res = CAM_JPEG_W,
-        .v_res = CAM_JPEG_H,
-        .pic_format_jpeg = 1,               /* hardware JPEG, colour fields ignored */
+        .h_res = CAM_LCD_W,
+        .v_res = CAM_LCD_H,
+        .pic_format_jpeg = 0,               /* raw RGB565 straight to the panel */
         .input_data_color_type = CAM_CTLR_COLOR_RGB565,
         .output_data_color_type = CAM_CTLR_COLOR_RGB565,
         .conv_std = COLOR_CONV_STD_RGB_YUV_BT601,
@@ -195,7 +475,8 @@ static esp_err_t camera_init(esp_cam_ctlr_handle_t *out_handle, i2c_master_bus_h
         return ret;
     }
 
-    /* one allocation, split in half - 320*240 is a multiple of the DMA alignment */
+    /* one allocation, split in half - 240*240*2 is a multiple of the DMA and
+     * cache-line alignment, which the JPEG encoder also relies on */
     uint8_t *cam_buffer = esp_cam_ctlr_alloc_buffer(cam_handle, CAM_FRAME_MAX * 2,
                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     if (cam_buffer == NULL) {
@@ -368,9 +649,311 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* Modem sleep parks the radio between beacons and inflates the TCP round-trip
+     * to ~45 ms, which caps a single stream at snd_buf/RTT.  /shot pushes an
+     * uncompressed 240x240 frame (173 KB), so keep the radio awake: the board is
+     * USB powered and the extra draw buys a several-fold throughput gain. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     ESP_LOGI(TAG, "waiting for Wi-Fi (%s)...", CONFIG_SENSOR_DASH_WIFI_SSID);
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+}
+
+/* ------------------- Persistent telemetry queue ------------------- */
+
+static uint32_t tlm_crc32(const void *data, size_t len)
+{
+    const uint8_t *p = data;
+    uint32_t hash = 2166136261UL; /* FNV-1a: detects partial Flash writes. */
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= p[i];
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+static bool tlm_record_valid(const telemetry_record_t *record)
+{
+    return record->magic == TLM_MAGIC && record->version == TLM_VERSION &&
+           record->state != 0xFFU &&
+           record->crc32 == tlm_crc32(&record->boot_id,
+                                      offsetof(telemetry_record_t, crc32) - offsetof(telemetry_record_t, boot_id));
+}
+
+static esp_err_t tlm_read_slot(size_t slot, telemetry_record_t *record)
+{
+    return esp_partition_read(s_tlm_partition, slot * TLM_RECORD_SIZE, record, sizeof(*record));
+}
+
+static bool tlm_slot_blank(size_t slot)
+{
+    uint32_t header[2] = {0};
+    if (esp_partition_read(s_tlm_partition, slot * TLM_RECORD_SIZE, header, sizeof(header)) != ESP_OK) {
+        return false;
+    }
+    return header[0] == 0xFFFFFFFFUL && header[1] == 0xFFFFFFFFUL;
+}
+
+static void tlm_store_drop_count(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("telemetry", NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u32(nvs, "dropped", s_queue_dropped);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
+static void tlm_restore_drop_count(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("telemetry", NVS_READONLY, &nvs) == ESP_OK) {
+        nvs_get_u32(nvs, "dropped", &s_queue_dropped);
+        nvs_close(nvs);
+    }
+}
+
+static size_t tlm_find_blank_from(size_t start)
+{
+    for (size_t offset = 0; offset < s_queue_slots; ++offset) {
+        size_t slot = (start + offset) % s_queue_slots;
+        if (tlm_slot_blank(slot)) {
+            return slot;
+        }
+    }
+    return s_queue_slots;
+}
+
+static size_t tlm_reclaim_oldest_sector(void)
+{
+    const size_t slots_per_sector = TLM_SECTOR_SIZE / TLM_RECORD_SIZE;
+    const size_t sector_count = s_tlm_partition->size / TLM_SECTOR_SIZE;
+    size_t selected = 0;
+    int64_t oldest = INT64_MAX;
+    bool found_pending = false;
+
+    for (size_t sector = 0; sector < sector_count; ++sector) {
+        for (size_t j = 0; j < slots_per_sector; ++j) {
+            telemetry_record_t record;
+            if (tlm_read_slot(sector * slots_per_sector + j, &record) != ESP_OK || !tlm_record_valid(&record)) {
+                continue;
+            }
+            if (record.state == TLM_STATE_PENDING && record.captured_at_ms < oldest) {
+                oldest = record.captured_at_ms;
+                selected = sector;
+                found_pending = true;
+            }
+        }
+    }
+    if (!found_pending) {
+        selected = 0;
+    }
+
+    size_t discarded = 0;
+    for (size_t j = 0; j < slots_per_sector; ++j) {
+        telemetry_record_t record;
+        if (tlm_read_slot(selected * slots_per_sector + j, &record) == ESP_OK &&
+            tlm_record_valid(&record) && record.state == TLM_STATE_PENDING) {
+            ++discarded;
+        }
+    }
+    if (esp_partition_erase_range(s_tlm_partition, selected * TLM_SECTOR_SIZE, TLM_SECTOR_SIZE) != ESP_OK) {
+        ESP_LOGE(TAG, "telemetry queue sector erase failed");
+        return s_queue_slots;
+    }
+    if (discarded) {
+        s_queue_depth = s_queue_depth > discarded ? s_queue_depth - discarded : 0;
+        s_queue_dropped += discarded;
+        tlm_store_drop_count();
+        ESP_LOGW(TAG, "telemetry queue full; dropped %u oldest sample(s)", (unsigned)discarded);
+    }
+    return selected * slots_per_sector;
+}
+
+static void tlm_queue_init(void)
+{
+    s_tlm_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                               ESP_PARTITION_SUBTYPE_ANY, "telemetry");
+    if (s_tlm_partition == NULL || s_tlm_partition->size < TLM_SECTOR_SIZE) {
+        ESP_LOGE(TAG, "telemetry partition missing; remote storage disabled");
+        return;
+    }
+    s_queue_slots = s_tlm_partition->size / TLM_RECORD_SIZE;
+    for (size_t slot = 0; slot < s_queue_slots; ++slot) {
+        telemetry_record_t record;
+        if (tlm_read_slot(slot, &record) == ESP_OK && tlm_record_valid(&record) &&
+            record.state == TLM_STATE_PENDING) {
+            ++s_queue_depth;
+        }
+    }
+    s_queue_write_slot = tlm_find_blank_from(0);
+    tlm_restore_drop_count();
+    ESP_LOGI(TAG, "telemetry queue: %u pending / %u slots", (unsigned)s_queue_depth,
+             (unsigned)s_queue_slots);
+}
+
+static bool tlm_enqueue(const telemetry_snapshot_t *sample)
+{
+    if (s_tlm_partition == NULL) return false;
+    if (s_queue_write_slot >= s_queue_slots || !tlm_slot_blank(s_queue_write_slot)) {
+        s_queue_write_slot = tlm_find_blank_from(s_queue_write_slot % s_queue_slots);
+    }
+    if (s_queue_write_slot >= s_queue_slots) {
+        s_queue_write_slot = tlm_reclaim_oldest_sector();
+        if (s_queue_write_slot >= s_queue_slots) return false;
+    }
+
+    telemetry_record_t record = {
+        .magic = TLM_MAGIC, .state = TLM_STATE_PENDING, .version = TLM_VERSION,
+        .boot_id = s_boot_id, .sequence = ++s_sample_sequence,
+        .captured_at_ms = sample->captured_at_ms,
+        .temp_c = sample->temp_c, .heap_int = sample->heap_int, .heap_psram = sample->heap_psram,
+        .fps = sample->fps, .jpeg = sample->jpeg, .accel_ok = sample->accel_ok,
+        .accel_x_g = sample->accel_x_g, .accel_y_g = sample->accel_y_g,
+        .accel_z_g = sample->accel_z_g, .accel_mag_g = sample->accel_mag_g,
+        .accel_range_g = 4, .accel_id = sample->accel_id,
+        .uptime_s = sample->uptime_s, .cpu_mhz = sample->cpu_mhz, .rssi = sample->rssi,
+        .lcd_frames = sample->lcd_frames, .lcd_fps = sample->lcd_fps,
+        .lcd_err = sample->lcd_err,
+    };
+    strncpy(record.ip, sample->ip, sizeof(record.ip) - 1);
+    record.crc32 = tlm_crc32(&record.boot_id,
+                             offsetof(telemetry_record_t, crc32) - offsetof(telemetry_record_t, boot_id));
+    if (esp_partition_write(s_tlm_partition, s_queue_write_slot * TLM_RECORD_SIZE,
+                            &record, sizeof(record)) != ESP_OK) {
+        ESP_LOGE(TAG, "telemetry queue write failed");
+        return false;
+    }
+    ++s_queue_depth;
+    s_queue_write_slot = (s_queue_write_slot + 1) % s_queue_slots;
+    return true;
+}
+
+static size_t tlm_load_batch(telemetry_record_t *records, size_t *slots, size_t limit)
+{
+    if (s_queue_depth == 0) {
+        return 0;
+    }
+    /* PENDING records form one contiguous run that ends just before the write
+     * cursor: records are appended at the cursor and acknowledged oldest-first,
+     * so the run always has exactly s_queue_depth entries.  Starting one
+     * run-length back turns this from "read all 48640 slots of the 6 MB
+     * partition" (~2.8 s per upload cycle) into a handful of reads.  The loop is
+     * still bounded by s_queue_slots and only stops once it has actually found
+     * `want` records, so if the layout ever surprises us the cost is time, not
+     * correctness. */
+    const size_t want = (s_queue_depth < limit) ? s_queue_depth : limit;
+    const size_t back = (s_queue_depth < s_queue_slots) ? s_queue_depth : s_queue_slots;
+    const size_t start = (s_queue_write_slot + s_queue_slots - back) % s_queue_slots;
+
+    size_t count = 0;
+    for (size_t offset = 0; offset < s_queue_slots && count < want; ++offset) {
+        size_t slot = (start + offset) % s_queue_slots;
+        telemetry_record_t record;
+        if (tlm_read_slot(slot, &record) == ESP_OK && tlm_record_valid(&record) &&
+            record.state == TLM_STATE_PENDING) {
+            records[count] = record;
+            slots[count++] = slot;
+        }
+    }
+    return count;
+}
+
+static void tlm_ack_batch(const size_t *slots, size_t count)
+{
+    const uint8_t acked = TLM_STATE_ACKED;
+    for (size_t i = 0; i < count; ++i) {
+        if (esp_partition_write(s_tlm_partition, slots[i] * TLM_RECORD_SIZE +
+                                offsetof(telemetry_record_t, state), &acked, sizeof(acked)) == ESP_OK) {
+            if (s_queue_depth) --s_queue_depth;
+        }
+    }
+}
+
+static int64_t tlm_now_ms(void)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    /* Return 0 before SNTP has set a plausible Unix clock. */
+    return now.tv_sec >= 1577836800 ? (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000 : 0;
+}
+
+static void tlm_start_sntp(void)
+{
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_err_t err = esp_netif_sntp_init(&config);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(err));
+    }
+}
+
+static bool tlm_post_batch(const telemetry_record_t *records, size_t count)
+{
+    char *body = heap_caps_malloc(12288, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (body == NULL) body = malloc(12288);
+    if (body == NULL) return false;
+    size_t used = (size_t)snprintf(body, 12288, "{\"device_id\":\"%s\",\"samples\":[",
+                                   CONFIG_SENSOR_DASH_DEVICE_ID);
+    for (size_t i = 0; i < count && used < 12000; ++i) {
+        const telemetry_record_t *r = &records[i];
+        int written = snprintf(body + used, 12288 - used,
+            "%s{\"boot_id\":\"%016" PRIx64 "\",\"sequence\":%" PRIu32
+            ",\"captured_at_ms\":%" PRId64 ",\"temp_c\":%.2f,\"heap_int\":%" PRIu32
+            ",\"heap_psram\":%" PRIu32 ",\"fps\":%.2f,\"jpeg\":%" PRIu32
+            ",\"accel_ok\":%s,\"accel_x_g\":%.4f,\"accel_y_g\":%.4f,\"accel_z_g\":%.4f"
+            ",\"accel_mag_g\":%.4f,\"accel_range_g\":%" PRIu32 ",\"accel_id\":\"0x%02X\""
+            ",\"accel_chip\":\"%s\",\"uptime_s\":%" PRIu32 ",\"cpu_mhz\":%" PRIu32 ",\"rssi\":%" PRId32
+            ",\"lcd_frames\":%" PRIu32 ",\"lcd_fps\":%.2f,\"lcd_err\":%" PRIu32
+            ",\"ip\":\"%s\"}",
+            i ? "," : "", r->boot_id, r->sequence, r->captured_at_ms, r->temp_c,
+            r->heap_int, r->heap_psram, r->fps, r->jpeg, r->accel_ok ? "true" : "false",
+            r->accel_x_g, r->accel_y_g, r->accel_z_g, r->accel_mag_g, r->accel_range_g,
+            r->accel_id, qma_chip_name(r->accel_id), r->uptime_s, r->cpu_mhz, r->rssi,
+            r->lcd_frames, r->lcd_fps, r->lcd_err, r->ip);
+        if (written < 0 || (size_t)written >= 12288 - used) {
+            free(body);
+            return false;
+        }
+        used += (size_t)written;
+    }
+    snprintf(body + used, 12288 - used, "]}");
+    esp_http_client_config_t config = {.url = CONFIG_SENSOR_DASH_COLLECTOR_URL,
+                                       .method = HTTP_METHOD_POST, .timeout_ms = 5000};
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) { free(body); return false; }
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Api-Key", CONFIG_SENSOR_DASH_COLLECTOR_API_KEY);
+    esp_http_client_set_post_field(client, body, strlen(body));
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    free(body);
+    return err == ESP_OK && status >= 200 && status < 300;
+}
+
+static void telemetry_upload_task(void *arg)
+{
+    const TickType_t delay = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_UPLOAD_INTERVAL_MS);
+    while (true) {
+        vTaskDelay(delay);
+        if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) || s_tlm_partition == NULL) continue;
+        telemetry_snapshot_t sample;
+        xSemaphoreTake(s_tlm_lock, portMAX_DELAY);
+        sample = s_latest_sample;
+        xSemaphoreGive(s_tlm_lock);
+        if (sample.uptime_s) tlm_enqueue(&sample);
+
+        telemetry_record_t records[TLM_BATCH_MAX];
+        size_t slots[TLM_BATCH_MAX];
+        size_t count = tlm_load_batch(records, slots, TLM_BATCH_MAX);
+        if (count) {
+            s_upload_ok = tlm_post_batch(records, count);
+            if (s_upload_ok) {
+                tlm_ack_batch(slots, count);
+                s_last_upload_ms = tlm_now_ms();
+            }
+        }
+    }
 }
 
 /* ---------------------- HTTP handlers ---------------------- */
@@ -385,26 +968,83 @@ static esp_err_t index_handler(httpd_req_t *req)
     return e;
 }
 
-/* GET /shot -> the most recent JPEG frame */
+/* ------------------------- BMP snapshot ------------------------- */
+
+static inline void put_le16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static inline void put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+/* 14-byte BITMAPFILEHEADER + 40-byte BITMAPINFOHEADER, 24 bpp, BI_RGB.
+ * A negative height marks the rows as top-down, which matches the order the
+ * camera fills its buffer in.  240 * 3 bytes is already a multiple of 4, so
+ * BMP's 4-byte row padding is a no-op here. */
+static void shot_bmp_write_header(uint8_t *out)
+{
+    memset(out, 0, SHOT_BMP_HEADER_SIZE);
+    out[0] = 'B';
+    out[1] = 'M';
+    put_le32(out + 2,  (uint32_t)SHOT_BMP_SIZE);
+    put_le32(out + 10, SHOT_BMP_HEADER_SIZE);          /* pixel data offset */
+    put_le32(out + 14, 40);                            /* BITMAPINFOHEADER size */
+    put_le32(out + 18, CAM_LCD_W);
+    put_le32(out + 22, (uint32_t)(-(int32_t)CAM_LCD_H));
+    put_le16(out + 26, 1);                             /* planes */
+    put_le16(out + 28, 24);                            /* bits per pixel */
+    put_le32(out + 30, 0);                             /* BI_RGB, no compression */
+    put_le32(out + 34, (uint32_t)SHOT_BMP_PIXELS);
+    put_le32(out + 38, 2835);                          /* ~72 dpi */
+    put_le32(out + 42, 2835);
+}
+
+/* The OV2640 hands the DVP bus big-endian RGB565, which is exactly the byte
+ * order the ST7789 expects; BMP wants BGR888, so expand and swap here. */
+static void shot_bmp_fill_pixels(const uint8_t *rgb565, uint8_t *bgr)
+{
+    for (size_t i = 0; i < (size_t)CAM_LCD_W * CAM_LCD_H; ++i) {
+        uint16_t px = (uint16_t)(((uint16_t)rgb565[0] << 8) | rgb565[1]);
+        rgb565 += 2;
+        const uint32_t r5 = (px >> 11) & 0x1FU;
+        const uint32_t g6 = (px >> 5) & 0x3FU;
+        const uint32_t b5 = px & 0x1FU;
+        *bgr++ = (uint8_t)((b5 << 3) | (b5 >> 2));
+        *bgr++ = (uint8_t)((g6 << 2) | (g6 >> 4));
+        *bgr++ = (uint8_t)((r5 << 3) | (r5 >> 2));
+    }
+}
+
+/* GET /shot -> the newest viewfinder frame as an uncompressed 24-bit BMP.
+ *
+ * The capture pipeline runs in RGB565 for the panel, so the snapshot is a plain
+ * colour-space conversion of the very same frame.  The capture buffer is only
+ * reserved for the ~3 ms the conversion needs; the (much slower) network send
+ * happens afterwards so the 25 fps LCD feed is not stalled. */
 static esp_err_t shot_handler(httpd_req_t *req)
 {
     int idx = s_cam_ctx.ready;
-    size_t len = (idx >= 0) ? s_cam_ctx.len[idx] : 0;
-    if (idx < 0 || len < 512) {
+    if (idx < 0 || s_shot_bmp == NULL) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_sendstr(req, "no frame yet\r\n");
         return ESP_FAIL;
     }
 
-    /* keep the DMA out of this buffer while we stream it out */
     s_cam_ctx.lock = idx;
-    vTaskDelay(pdMS_TO_TICKS(40));      /* ~2 frames @ 50 fps */
-
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    esp_err_t e = httpd_resp_send(req, (const char *)s_cam_ctx.buf[idx], len);
+    cam_frame_sync(s_cam_ctx.buf[idx]);
+    shot_bmp_fill_pixels(s_cam_ctx.buf[idx], s_shot_bmp + SHOT_BMP_HEADER_SIZE);
     s_cam_ctx.lock = -1;
 
+    httpd_resp_set_type(req, "image/bmp");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t e = httpd_resp_send(req, (const char *)s_shot_bmp, SHOT_BMP_SIZE);
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "shot send failed: %s", esp_err_to_name(e));
     }
@@ -473,6 +1113,7 @@ static void start_webserver(void)
 void app_main(void)
 {
     s_json_lock = xSemaphoreCreateMutex();
+    s_tlm_lock = xSemaphoreCreateMutex();
 
     /* NVS is required by the Wi-Fi driver */
     esp_err_t err = nvs_flash_init();
@@ -481,6 +1122,8 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    s_boot_id = ((uint64_t)esp_random() << 32) | esp_random();
+    tlm_queue_init();
 
     /* --- on-chip temperature sensor --- */
     temperature_sensor_handle_t temp_sensor = NULL;
@@ -494,11 +1137,32 @@ void app_main(void)
         ESP_LOGW(TAG, "temperature sensor unavailable");
     }
 
+    /* --- ST7789 viewfinder panel (SPI3), driven by the camera frames --- */
+    lcd_init();
+    ESP_LOGI(TAG, "LCD ready (%dx%d)", CAM_LCD_W, CAM_LCD_H);
+
+    /* --- BMP snapshot buffer that backs /shot --- */
+    s_shot_bmp = heap_caps_malloc(SHOT_BMP_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_shot_bmp == NULL) {
+        ESP_LOGW(TAG, "snapshot buffer alloc failed; /shot disabled");
+    } else {
+        shot_bmp_write_header(s_shot_bmp);
+        ESP_LOGI(TAG, "snapshot ready: %ux%u BMP, %u bytes", CAM_LCD_W, CAM_LCD_H, (unsigned)SHOT_BMP_SIZE);
+    }
+
     /* --- camera + shared I2C bus --- */
     esp_cam_ctlr_handle_t cam_handle = NULL;
     i2c_master_bus_handle_t shared_i2c_bus = NULL;
     bool cam_ok = (camera_init(&cam_handle, &shared_i2c_bus) == ESP_OK);
     ESP_LOGI(TAG, "camera %s", cam_ok ? "ready" : "unavailable - fps will be 0");
+    if (cam_ok) {
+        /* Check the result: a task that never started leaves lcd_frames at 0
+         * forever with no other symptom - the same silent-failure shape as the
+         * bounce-buffer bug this counter was added to catch. */
+        if (xTaskCreate(lcd_refresh_task, "lcd_refresh", 4096, NULL, 4, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "lcd_refresh task creation failed - the panel will stay blank");
+        }
+    }
     if (shared_i2c_bus != NULL) {
         qma_init(shared_i2c_bus);
     }
@@ -508,18 +1172,34 @@ void app_main(void)
 
     /* --- Wi-Fi + web server --- */
     wifi_init_sta();
+    tlm_start_sntp();
     start_webserver();
     start_mdns();
+    if (xTaskCreate(telemetry_upload_task, "telemetry_upload", 8192, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "telemetry_upload task creation failed - nothing will reach the collector");
+    }
 
     const TickType_t interval = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_INTERVAL_MS);
-    const float interval_s = CONFIG_SENSOR_DASH_INTERVAL_MS / 1000.0f;
 
     /* discard the first window: it accumulates everything captured during boot */
     vTaskDelay(interval);
     s_cam_ctx.frame_count = 0;
+    s_lcd_frames_last = s_lcd_frames;   /* same for the panel: no bogus first lcd_fps */
+
+    /* fps is derived from the time that actually elapsed, not from the nominal
+     * interval: vTaskDelay only guarantees "at least", so a window stretched by
+     * a slow upload would otherwise report a frame rate the camera cannot hit. */
+    int64_t last_sample_us = esp_timer_get_time();
 
     while (1) {
         vTaskDelay(interval);
+
+        const int64_t now_us = esp_timer_get_time();
+        float interval_s = (float)(now_us - last_sample_us) / 1000000.0f;
+        last_sample_us = now_us;
+        if (interval_s <= 0.0f) {
+            interval_s = CONFIG_SENSOR_DASH_INTERVAL_MS / 1000.0f;
+        }
 
         float temp_c = 0;
         if (temp_ok) {
@@ -542,6 +1222,13 @@ void app_main(void)
         s_cam_ctx.frame_count = 0;
         float fps = cam_ok ? (frames / interval_s) : 0.0f;
 
+        /* Frames the panel IO reports as fully shifted out.  Counted with a
+         * plain subtraction so a wrap is harmless. */
+        const uint32_t lcd_total = s_lcd_frames;
+        const uint32_t lcd_delta = lcd_total - s_lcd_frames_last;
+        s_lcd_frames_last = lcd_total;
+        const float lcd_fps = lcd_delta / interval_s;
+
         float accel_x_g = 0, accel_y_g = 0, accel_z_g = 0;
         bool accel_ok = qma_read_accel(&accel_x_g, &accel_y_g, &accel_z_g);
         float accel_mag_g = sqrtf(accel_x_g * accel_x_g + accel_y_g * accel_y_g + accel_z_g * accel_z_g);
@@ -559,7 +1246,10 @@ void app_main(void)
                  "\"jpeg\":%lu,\"accel_ok\":%s,\"accel_x_g\":%.3f,\"accel_y_g\":%.3f,\"accel_z_g\":%.3f,"
                  "\"accel_mag_g\":%.3f,\"accel_range_g\":4,"
                  "\"accel_id\":\"0x%02X\",\"accel_chip\":\"%s\","
-                 "\"uptime_s\":%lu,\"cpu_mhz\":%lu,\"rssi\":%d,\"ip\":\"%s\"}",
+                 "\"uptime_s\":%lu,\"cpu_mhz\":%lu,\"rssi\":%d,\"ip\":\"%s\","
+                 "\"lcd_frames\":%lu,\"lcd_fps\":%.1f,\"lcd_err\":%lu,"
+                 "\"telemetry_queue\":%u,\"telemetry_dropped\":%lu,"
+                 "\"upload_ok\":%s,\"last_upload_ms\":%lld}",
                  temp_c,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),   /* internal SRAM only */
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -571,8 +1261,32 @@ void app_main(void)
                  (unsigned long)(esp_timer_get_time() / 1000000ULL),
                  (unsigned long)(esp_clk_cpu_freq() / 1000000UL),
                  s_rssi,
-                 s_ip);
+                 s_ip,
+                 (unsigned long)lcd_total, lcd_fps, (unsigned long)s_lcd_errors,
+                 (unsigned)s_queue_depth,
+                 (unsigned long)s_queue_dropped,
+                 s_upload_ok ? "true" : "false",
+                 (long long)s_last_upload_ms);
         xSemaphoreGive(s_json_lock);
+
+        telemetry_snapshot_t sample = {
+            .temp_c = temp_c,
+            .heap_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            .heap_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+            .fps = fps,
+            .jpeg = (uint32_t)(shot_idx >= 0 ? s_cam_ctx.len[shot_idx] : 0),
+            .accel_ok = accel_ok,
+            .accel_x_g = accel_x_g, .accel_y_g = accel_y_g, .accel_z_g = accel_z_g,
+            .accel_mag_g = accel_mag_g, .accel_id = s_qma_id,
+            .uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
+            .cpu_mhz = (uint32_t)(esp_clk_cpu_freq() / 1000000UL),
+            .rssi = s_rssi, .captured_at_ms = tlm_now_ms(),
+            .lcd_frames = lcd_total, .lcd_fps = lcd_fps, .lcd_err = s_lcd_errors,
+        };
+        strncpy(sample.ip, s_ip, sizeof(sample.ip) - 1);
+        xSemaphoreTake(s_tlm_lock, portMAX_DELAY);
+        s_latest_sample = sample;
+        xSemaphoreGive(s_tlm_lock);
 
         /* same sample on the serial console, handy for debugging */
         printf("%s\n", s_json);

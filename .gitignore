@@ -17,9 +17,16 @@ managed_components/
 
 # Debug / capture artefacts
 *.log
+*.bmp
+*.png
 .vscode/
 .DS_Store
 
 # Python
 __pycache__/
 *.pyc
+
+# Local telemetry service data and secrets
+server/.env
+server/.venv/
+server/data/

@@ -42,7 +42,7 @@
        padding:14px 16px;margin-bottom:16px}
   .cam-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
   .cam-meta{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
-  .cam img{width:320px;max-width:100%;height:auto;display:block;border-radius:6px;
+  .cam img{width:240px;max-width:100%;height:auto;display:block;border-radius:6px;
            background:#000;border:1px solid var(--border)}
   .charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
   @media(max-width:860px){.charts{grid-template-columns:1fr}}
@@ -79,6 +79,7 @@
       <span class="dot" id="dot"></span>
       <span class="badge" id="rateText">-- Hz</span>
       <span class="badge" id="uptimeText">--</span>
+      <span class="badge" id="uploadText">遥测等待中</span>
       <span class="chip-imu" id="imuChip">IMU 检测中…</span>
     </div>
   </header>
@@ -144,13 +145,16 @@ const CARDS = [
   {key:'heap_int',  label:'内部 SRAM',  unit:'KB',  fix:0, color:'c-green',  scale:1/1024},
   {key:'heap_psram',label:'PSRAM',      unit:'MB',  fix:2, color:'c-purple', scale:1/1048576},
   {key:'fps',       label:'摄像头帧率', unit:'fps', fix:0, color:'c-cyan'},
-  {key:'jpeg',      label:'JPEG 帧大小', unit:'KB', fix:1, color:'', scale:1/1024},
+  {key:'lcd_fps',   label:'屏幕推帧',   unit:'fps', fix:0, color:'c-cyan'},
+  {key:'jpeg',      label:'取景帧大小', unit:'KB',  fix:1, color:'', scale:1/1024},
   {key:'accel_x_g', label:'加速度 X',    unit:'g',   fix:3, color:'', accel:true},
   {key:'accel_y_g', label:'加速度 Y',    unit:'g',   fix:3, color:'', accel:true},
   {key:'accel_z_g', label:'加速度 Z',    unit:'g',   fix:3, color:'', accel:true},
   {key:'accel_mag_g',label:'合加速度 |a|',unit:'g',  fix:3, color:'c-green', accel:true,
    sub:v=>(Math.abs(v)<0.85||Math.abs(v)>1.18) ? '非静止或需校准' : '静止 ≈ 1 g'},
   {key:'rssi',      label:'WiFi 信号',  unit:'dBm', fix:0, color:'c-cyan'},
+  {key:'telemetry_queue', label:'遥测待上传', unit:'条', fix:0, color:'c-purple'},
+  {key:'telemetry_dropped', label:'遥测已丢弃', unit:'条', fix:0, color:'c-red'},
 ];
 const HISTORY = 120;
 let samples = [], lastTime = performance.now(), rate = 0;
@@ -336,8 +340,19 @@ function push(d){
     document.getElementById('imuChip').textContent = 'IMU 未连接';
   }
   if(d.uptime_s != null) document.getElementById('uptimeText').textContent = '运行 ' + fmtUptime(d.uptime_s);
+  const upload = document.getElementById('uploadText');
+  if(d.upload_ok === true) {
+    upload.textContent = '遥测上传正常 · 待 ' + (d.telemetry_queue || 0);
+    upload.style.color = 'var(--green)';
+  } else if(d.upload_ok === false && d.telemetry_queue) {
+    upload.textContent = '遥测暂未上传 · 待 ' + d.telemetry_queue;
+    upload.style.color = 'var(--yellow)';
+  }
   if(d.jpeg != null) document.getElementById('camMeta').textContent =
-    (d.jpeg/1024).toFixed(1) + ' KB / 帧 · ' + (d.fps != null ? d.fps.toFixed(0) + ' fps' : '--');
+    'RGB565 ' + (d.jpeg/1024).toFixed(1) + ' KB / 帧 · ' + (d.fps != null ? d.fps.toFixed(0) + ' fps' : '--') +
+    ' · 推屏 ' + (d.lcd_fps != null ? d.lcd_fps.toFixed(0) + ' fps' : '--') +
+    (d.lcd_frames != null ? '（共 ' + d.lcd_frames + ' 帧）' : '') +
+    (d.lcd_err ? ' · 推屏失败 ' + d.lcd_err + ' 次' : '');
   const log = document.getElementById('logBox');
   log.textContent = JSON.stringify(d) + '\n' + log.textContent.split('\n').slice(0,6).join('\n');
 }
@@ -355,17 +370,26 @@ async function tick(){
   rate = rate*0.8 + (1000/(now-lastTime))*0.2; lastTime = now;
   document.getElementById('rateText').textContent = rate.toFixed(1) + ' Hz';
 }
-/* live camera: preload into an off-DOM Image so the visible one never blanks */
+/* live camera: preload into an off-DOM Image so the visible one never blanks.
+ *
+ * A 240x240 frame is 173 KB uncompressed, so fetching them back-to-back uses
+ * essentially the whole link (~500 KB/s).  That starves the board: its socket
+ * pool is small (CONFIG_LWIP_MAX_SOCKETS), /data polls start timing out, and the
+ * telemetry upload can fail to even open a socket.  One frame per second is
+ * plenty for a viewfinder and leaves the link free for everything else - lower
+ * CAM_MIN_GAP_MS for a smoother preview if you accept a less responsive board. */
+const CAM_MIN_GAP_MS = 1000;
 const camImg = document.getElementById('camImg');
-let camBusy = false;
+let camBusy = false, camNext = 0;
 function refreshCam(){
-  if(camBusy) return;
+  if(camBusy || performance.now() < camNext) return;
   camBusy = true;
   const pre = new Image();
-  pre.onload  = () => { camImg.src = pre.src; camBusy = false; };
-  pre.onerror = () => { camBusy = false; };
+  const done = () => { camBusy = false; camNext = performance.now() + CAM_MIN_GAP_MS; };
+  pre.onload  = () => { camImg.src = pre.src; done(); };
+  pre.onerror = done;
   pre.src = '/shot?t=' + Date.now();
-  setTimeout(() => { camBusy = false; }, 4000);   /* never get stuck on a lost response */
+  setTimeout(done, 8000);   /* never get stuck on a lost response */
 }
 
 buildCards();

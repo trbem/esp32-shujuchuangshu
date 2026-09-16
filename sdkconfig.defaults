@@ -4,3 +4,18 @@ CONFIG_CAM_CTRL_SPI_ENABLE=n
 # print the JSON samples on the USB Serial/JTAG console (not the UART)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- Networking -------------------------------------------------------------
+# /shot hands the browser an uncompressed 240x240 frame (173 KB) because the
+# ESP32-S3 has no JPEG encoder.  At the stock 5760-byte send buffer the single
+# stream is capped at snd_buf/RTT (~125 KB/s), so one frame takes >1.4 s.
+# 32768 restores ~400-580 KB/s.  Keep these here, not only in the git-ignored
+# sdkconfig, or a fresh clone silently regresses to the slow path.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+# The dashboard's /shot loop plus /data polling plus the telemetry client need
+# more than the stock 10 sockets; running out shows up as
+# "httpd_accept_conn: error in accept (23)" and failed telemetry uploads.
+CONFIG_LWIP_MAX_SOCKETS=16

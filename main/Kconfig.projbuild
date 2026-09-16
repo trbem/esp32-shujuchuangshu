@@ -18,4 +18,28 @@ menu "Sensor Dashboard Configuration"
         help
             How often the board prints one JSON line with the sensor readings.
 
+    config SENSOR_DASH_COLLECTOR_URL
+        string "Telemetry collector URL"
+        default "http://192.168.1.100:8080/api/v1/telemetry"
+        help
+            Set this to the LAN address of the computer running the telemetry server.
+
+    config SENSOR_DASH_COLLECTOR_API_KEY
+        string "Telemetry collector API key"
+        default "CHANGE_ME"
+        help
+            Must match TELEMETRY_API_KEY in the computer server's .env file.
+            Keep the real value in git-ignored sdkconfig.
+
+    config SENSOR_DASH_DEVICE_ID
+        string "Telemetry device ID"
+        default "s3eye-001"
+
+    config SENSOR_DASH_UPLOAD_INTERVAL_MS
+        int "Telemetry upload interval (ms)"
+        default 5000
+        range 1000 3600000
+        help
+            A current sensor snapshot is appended to Flash and uploaded at this interval.
+
 endmenu

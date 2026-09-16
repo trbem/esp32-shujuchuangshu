@@ -1,11 +1,16 @@
 """Capture N seconds of USB Serial/JTAG output to a text file.
 
     python serial_capture.py COM5 20 out.log
+
+Passive capture: this script must NOT reset the board, or the state you are
+trying to observe is destroyed before the first byte arrives.  See
+_serial_port.py - a plain serial.Serial(...) open asserts DTR/RTS, which on the
+ESP32-S3 USB Serial/JTAG *is* the reset sequence.
 """
 import sys
 import time
 
-import serial
+from _serial_port import open_port
 
 
 def main():
@@ -13,7 +18,7 @@ def main():
     secs = float(sys.argv[2]) if len(sys.argv) > 2 else 20.0
     out = sys.argv[3] if len(sys.argv) > 3 else "serial.log"
 
-    ser = serial.Serial(port, 115200, timeout=0.2)
+    ser = open_port(port)
     buf = bytearray()
     end = time.time() + secs
     try:

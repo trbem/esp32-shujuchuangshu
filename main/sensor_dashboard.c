@@ -1065,12 +1065,28 @@ static void capture_task_poll_task(void *arg)
         char path[128], url[192], response[512];
         snprintf(path, sizeof(path), "/api/v1/devices/%s/tasks/next", CONFIG_SENSOR_DASH_DEVICE_ID);
         task_url(url, sizeof(url), path);
-        if (!task_http_request(url, HTTP_METHOD_GET, NULL, response, sizeof(response))) continue;
+        if (!task_http_request(url, HTTP_METHOD_GET, NULL, response, sizeof(response))) {
+            ESP_LOGW(TAG, "capture-task poll request failed");
+            continue;
+        }
         const char *marker = strstr(response, "\"request_id\":\"");
-        if (!marker || strlen(marker + 14) < 37 || marker[14 + 36] != '\"') continue;
+        if (!marker) {
+            if (!strstr(response, "\"task\":null")) {
+                ESP_LOGW(TAG, "capture-task poll returned unexpected payload: %s", response);
+            }
+            continue;
+        }
+        if (strlen(marker + 14) < 37 || marker[14 + 36] != '\"') {
+            ESP_LOGW(TAG, "capture-task request_id is malformed");
+            continue;
+        }
         strncpy(s_active_task_id, marker + 14, sizeof(s_active_task_id) - 1);
         s_active_task_id[sizeof(s_active_task_id) - 1] = '\0';
-        if (!task_post_ack(s_active_task_id)) continue;
+        if (!task_post_ack(s_active_task_id)) {
+            ESP_LOGW(TAG, "capture-task ACK failed for %.8s", s_active_task_id);
+            continue;
+        }
+        ESP_LOGI(TAG, "capture-task ACK sent for %.8s", s_active_task_id);
 
         /* The metrics loop refreshes s_latest_sample every 500 ms.  Waiting one
          * interval after the receipt guarantees this task returns a new source
@@ -1081,8 +1097,11 @@ static void capture_task_poll_task(void *arg)
         xSemaphoreGive(s_tlm_lock);
         s_task_result_pending = true;
         if (task_post_result(s_active_task_id, &s_task_result_sample)) {
+            ESP_LOGI(TAG, "capture-task result sent for %.8s", s_active_task_id);
             s_task_result_pending = false;
             s_active_task_id[0] = '\0';
+        } else {
+            ESP_LOGW(TAG, "capture-task result send failed for %.8s", s_active_task_id);
         }
     }
 }

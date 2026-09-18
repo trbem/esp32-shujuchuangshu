@@ -93,11 +93,9 @@ static const char *TAG = "sensor_dash";
 #define LCD_BL_LEDC_CHANNEL     (LEDC_CHANNEL_0)
 
 /* ------------- capture format ------------- */
-/* The DVP controller can only run one capture format at a time.  We now capture
- * raw RGB565 at the panel's native 240x240 so the LCD gets a smooth 25 fps
- * viewfinder; the web snapshot is produced on demand by the S3 hardware JPEG
- * encoder from the very same frame (see shot_handler), so /shot still returns a
- * real JPEG without a second capture pipeline. */
+/* The DVP controller captures raw RGB565 at the panel's native 240x240 so the
+ * LCD gets a smooth 25 fps viewfinder.  ESP32-S3 has no JPEG encoder, therefore
+ * local /shot and remotely requested photos use a BMP made from that same frame. */
 #define CAM_FORMAT_NAME     "DVP_8bit_20Minput_RGB565_240x240_25fps"
 #define CAM_LCD_W           (240)
 #define CAM_LCD_H           (240)
@@ -205,6 +203,9 @@ static int64_t s_last_upload_ms;
 static char s_active_task_id[37];
 static bool s_task_result_pending;
 static telemetry_snapshot_t s_task_result_sample;
+static char s_photo_task_id[37];
+static bool s_photo_upload_pending;
+static int64_t s_photo_captured_at_ms;
 
 /* QMA6100P accelerometer, driven by the official Espressif component
  * (espressif/qma6100p) - the same driver model the display_rotation example uses.
@@ -238,6 +239,7 @@ static cam_ctx_t s_cam_ctx = {0};
  * through a plain <img>, so the dashboard needs no JavaScript changes. */
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static uint8_t               *s_shot_bmp = NULL;
+static uint8_t               *s_photo_bmp = NULL;
 
 /* Monotonic count of frames actually shifted into the panel.  The SPI panel IO
  * raises on_color_trans_done once per whole frame (after every chunk of a split
@@ -254,6 +256,8 @@ static volatile uint32_t s_lcd_errors = 0;
 #define SHOT_BMP_HEADER_SIZE  (54U)                                     /* 14 + 40 */
 #define SHOT_BMP_PIXELS       ((size_t)CAM_LCD_W * CAM_LCD_H * 3U)      /* BGR888  */
 #define SHOT_BMP_SIZE         (SHOT_BMP_HEADER_SIZE + SHOT_BMP_PIXELS)
+
+static bool camera_copy_latest_to_bmp(uint8_t *out);
 
 /* ------------------------- helpers ------------------------- */
 
@@ -1049,12 +1053,56 @@ static bool task_post_result(const char *request_id, const telemetry_snapshot_t 
     return ok;
 }
 
+static bool task_post_failure(const char *request_id, const char *error)
+{
+    char url[192], body[300];
+    task_url(url, sizeof(url), "/api/v1/capture-tasks/");
+    size_t url_used = strlen(url);
+    snprintf(url + url_used, sizeof(url) - url_used, "%s/fail", request_id);
+    snprintf(body, sizeof(body), "{\"device_id\":\"%s\",\"error\":\"%s\"}",
+             CONFIG_SENSOR_DASH_DEVICE_ID, error);
+    return task_http_request(url, HTTP_METHOD_POST, body, NULL, 0);
+}
+
+static bool task_post_photo(const char *request_id, int64_t captured_at_ms)
+{
+    if (s_photo_bmp == NULL) return false;
+    char url[192], captured_at[32];
+    task_url(url, sizeof(url), "/api/v1/capture-tasks/");
+    size_t url_used = strlen(url);
+    snprintf(url + url_used, sizeof(url) - url_used, "%s/photo", request_id);
+    snprintf(captured_at, sizeof(captured_at), "%" PRId64, captured_at_ms);
+
+    esp_http_client_config_t config = {.url = url, .method = HTTP_METHOD_POST, .timeout_ms = 10000};
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) return false;
+    esp_http_client_set_header(client, "Content-Type", "image/bmp");
+    esp_http_client_set_header(client, "X-Api-Key", CONFIG_SENSOR_DASH_COLLECTOR_API_KEY);
+    esp_http_client_set_header(client, "X-Device-Id", CONFIG_SENSOR_DASH_DEVICE_ID);
+    esp_http_client_set_header(client, "X-Captured-At-Ms", captured_at);
+    esp_http_client_set_post_field(client, (const char *)s_photo_bmp, SHOT_BMP_SIZE);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    return err == ESP_OK && status >= 200 && status < 300;
+}
+
 static void capture_task_poll_task(void *arg)
 {
     const TickType_t delay = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_TASK_POLL_INTERVAL_MS);
     while (true) {
         vTaskDelay(delay);
         if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT)) continue;
+        if (s_photo_upload_pending) {
+            if (task_post_photo(s_photo_task_id, s_photo_captured_at_ms)) {
+                ESP_LOGI(TAG, "capture-photo uploaded for %.8s", s_photo_task_id);
+                s_photo_upload_pending = false;
+                s_photo_task_id[0] = '\0';
+            } else {
+                ESP_LOGW(TAG, "capture-photo upload failed for %.8s", s_photo_task_id);
+            }
+            continue;
+        }
         if (s_task_result_pending) {
             if (task_post_result(s_active_task_id, &s_task_result_sample)) {
                 s_task_result_pending = false;
@@ -1087,6 +1135,33 @@ static void capture_task_poll_task(void *arg)
             continue;
         }
         ESP_LOGI(TAG, "capture-task ACK sent for %.8s", s_active_task_id);
+
+        if (strstr(response, "\"task_type\":\"capture_photo\"")) {
+            /* Wait beyond the 500 ms metric refresh period so this is a frame
+             * captured after the server acknowledged the command, not a cached
+             * picture from before the request. */
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_SENSOR_DASH_INTERVAL_MS + 100));
+            if (!camera_copy_latest_to_bmp(s_photo_bmp)) {
+                ESP_LOGW(TAG, "capture-photo camera frame unavailable for %.8s", s_active_task_id);
+                if (task_post_failure(s_active_task_id, "camera frame unavailable")) {
+                    s_active_task_id[0] = '\0';
+                }
+                continue;
+            }
+            strncpy(s_photo_task_id, s_active_task_id, sizeof(s_photo_task_id) - 1);
+            s_photo_task_id[sizeof(s_photo_task_id) - 1] = '\0';
+            s_active_task_id[0] = '\0';
+            s_photo_captured_at_ms = tlm_now_ms();
+            s_photo_upload_pending = true;
+            if (task_post_photo(s_photo_task_id, s_photo_captured_at_ms)) {
+                ESP_LOGI(TAG, "capture-photo uploaded for %.8s", s_photo_task_id);
+                s_photo_upload_pending = false;
+                s_photo_task_id[0] = '\0';
+            } else {
+                ESP_LOGW(TAG, "capture-photo upload failed for %.8s", s_photo_task_id);
+            }
+            continue;
+        }
 
         /* The metrics loop refreshes s_latest_sample every 500 ms.  Waiting one
          * interval after the receipt guarantees this task returns a new source
@@ -1172,6 +1247,20 @@ static void shot_bmp_fill_pixels(const uint8_t *rgb565, uint8_t *bgr)
     }
 }
 
+/* Copy exactly one completed camera frame into a caller-owned BMP buffer.  The
+ * expensive HTTP upload happens after this returns, so it never holds a camera
+ * buffer or slows the LCD viewfinder. */
+static bool camera_copy_latest_to_bmp(uint8_t *out)
+{
+    int idx = s_cam_ctx.ready;
+    if (idx < 0 || out == NULL) return false;
+    s_cam_ctx.lock = idx;
+    cam_frame_sync(s_cam_ctx.buf[idx]);
+    shot_bmp_fill_pixels(s_cam_ctx.buf[idx], out + SHOT_BMP_HEADER_SIZE);
+    s_cam_ctx.lock = -1;
+    return true;
+}
+
 /* GET /shot -> the newest viewfinder frame as an uncompressed 24-bit BMP.
  *
  * The capture pipeline runs in RGB565 for the panel, so the snapshot is a plain
@@ -1180,17 +1269,11 @@ static void shot_bmp_fill_pixels(const uint8_t *rgb565, uint8_t *bgr)
  * happens afterwards so the 25 fps LCD feed is not stalled. */
 static esp_err_t shot_handler(httpd_req_t *req)
 {
-    int idx = s_cam_ctx.ready;
-    if (idx < 0 || s_shot_bmp == NULL) {
+    if (s_shot_bmp == NULL || !camera_copy_latest_to_bmp(s_shot_bmp)) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_sendstr(req, "no frame yet\r\n");
         return ESP_FAIL;
     }
-
-    s_cam_ctx.lock = idx;
-    cam_frame_sync(s_cam_ctx.buf[idx]);
-    shot_bmp_fill_pixels(s_cam_ctx.buf[idx], s_shot_bmp + SHOT_BMP_HEADER_SIZE);
-    s_cam_ctx.lock = -1;
 
     httpd_resp_set_type(req, "image/bmp");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -1298,6 +1381,13 @@ void app_main(void)
     } else {
         shot_bmp_write_header(s_shot_bmp);
         ESP_LOGI(TAG, "snapshot ready: %ux%u BMP, %u bytes", CAM_LCD_W, CAM_LCD_H, (unsigned)SHOT_BMP_SIZE);
+    }
+    s_photo_bmp = heap_caps_malloc(SHOT_BMP_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_photo_bmp == NULL) {
+        ESP_LOGW(TAG, "remote photo buffer alloc failed; capture_photo tasks will fail");
+    } else {
+        shot_bmp_write_header(s_photo_bmp);
+        ESP_LOGI(TAG, "remote photo buffer ready: %u bytes", (unsigned)SHOT_BMP_SIZE);
     }
 
     /* --- camera + shared I2C bus --- */

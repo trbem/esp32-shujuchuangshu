@@ -175,6 +175,17 @@ New-NetFirewallRule -DisplayName "ESP32 Telemetry 8080" -Direction Inbound -Acti
 因此可用于课堂验证按钮触发而非周期上报。任务轮询间隔可在 menuconfig 中通过
 `On-demand capture task poll interval` 调整。
 
+### 局域网远程拍照
+
+电脑端历史页的 **远程拍照** 只创建一个 `capture_photo` 任务。ESP32-S3-EYE 收到任务后回执、等待一帧
+新的相机画面，并上传一张 240×240 BMP；它不会启动录像、定时拍摄或连续图片上传。上传使用与遥测相同的
+`X-Api-Key`，任务会在 `submitted`、`received`、`completed`、`failed`、`timeout` 之间流转。照片保存在
+服务器被 Git 忽略的 `server/data/photos/`，画廊按设备显示并在 7 天后自动清理；任务追踪记录仍会保留。
+
+上传中的网络故障会重试同一张缓冲照片。设备重启后，服务器仍会下发处于 `received` 的任务，板端会重新拍摄
+并补传；服务端以 `request_id` 去重，因此图库只保留一张照片。现有板载 `/shot` 与 LCD 取景仍可用，但它们
+仅服务本地预览，不会将画面上传到服务器。
+
 ## 目录结构
 
 ```

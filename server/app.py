@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import os
 import sqlite3
@@ -10,8 +11,9 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -67,6 +69,7 @@ class TelemetryBatch(BaseModel):
 
 class CaptureTaskCreate(BaseModel):
     device_id: str = Field(min_length=1, max_length=64)
+    task_type: Literal["capture_full_snapshot", "capture_photo"] = "capture_full_snapshot"
 
 
 class TaskAck(BaseModel):
@@ -114,10 +117,23 @@ CREATE TABLE IF NOT EXISTS capture_tasks (
   sensor_sources TEXT NOT NULL, status TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL,
   received_at_ms INTEGER, completed_at_ms INTEGER, failed_at_ms INTEGER,
-  error TEXT, telemetry_id INTEGER,
-  FOREIGN KEY(telemetry_id) REFERENCES telemetry(id)
+  error TEXT, telemetry_id INTEGER, photo_id INTEGER,
+  FOREIGN KEY(telemetry_id) REFERENCES telemetry(id),
+  FOREIGN KEY(photo_id) REFERENCES photos(id)
 );
 CREATE INDEX IF NOT EXISTS capture_tasks_status_idx ON capture_tasks(device_id, status, created_at_ms);
+CREATE TABLE IF NOT EXISTS photos (
+  id INTEGER PRIMARY KEY,
+  request_id TEXT NOT NULL UNIQUE,
+  device_id TEXT NOT NULL,
+  captured_at_ms INTEGER NOT NULL,
+  received_at_ms INTEGER NOT NULL,
+  content_type TEXT NOT NULL,
+  byte_size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  storage_name TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS photos_device_time_idx ON photos(device_id, received_at_ms DESC);
 """
 
 # Columns added after the first release.  CREATE TABLE IF NOT EXISTS leaves an
@@ -133,18 +149,34 @@ ADDED_COLUMNS = {
     "request_id": "TEXT",
 }
 
+TASK_ADDED_COLUMNS = {
+    "photo_id": "INTEGER",
+}
+
+PHOTO_WIDTH = 240
+PHOTO_HEIGHT = 240
+PHOTO_HEADER_SIZE = 54
+PHOTO_BYTE_SIZE = PHOTO_HEADER_SIZE + PHOTO_WIDTH * PHOTO_HEIGHT * 3
+PHOTO_RETENTION_MS = 7 * 86400 * 1000
+
 
 def add_missing_columns(conn: sqlite3.Connection) -> None:
     present = {row[1] for row in conn.execute("PRAGMA table_info(telemetry)")}
     for name, declaration in ADDED_COLUMNS.items():
         if name not in present:
             conn.execute(f"ALTER TABLE telemetry ADD COLUMN {name} {declaration}")
+    task_columns = {row[1] for row in conn.execute("PRAGMA table_info(capture_tasks)")}
+    for name, declaration in TASK_ADDED_COLUMNS.items():
+        if name not in task_columns:
+            conn.execute(f"ALTER TABLE capture_tasks ADD COLUMN {name} {declaration}")
 
 
 class Store:
     def __init__(self, database: Path) -> None:
         self.database = database
         self.database.parent.mkdir(parents=True, exist_ok=True)
+        self.photo_dir = self.database.parent / "photos"
+        self.photo_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_lock = threading.Lock()
         self._last_cleanup = 0.0
         with self.connect() as conn:
@@ -181,6 +213,18 @@ class Store:
                     "(captured_at_ms = 0 AND received_at_ms < ?)",
                     (cutoff, cutoff),
                 )
+                expired = conn.execute(
+                    "SELECT id, storage_name FROM photos WHERE received_at_ms < ?",
+                    (int(time.time() * 1000) - PHOTO_RETENTION_MS,),
+                ).fetchall()
+                for photo in expired:
+                    path = self.photo_dir / photo["storage_name"]
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    conn.execute("UPDATE capture_tasks SET photo_id=NULL WHERE photo_id=?", (photo["id"],))
+                    conn.execute("DELETE FROM photos WHERE id=?", (photo["id"],))
             self._last_cleanup = now
 
     def _insert_rows(self, conn: sqlite3.Connection, batch: TelemetryBatch, source: str = "periodic",
@@ -243,11 +287,12 @@ class Store:
         conn.execute("UPDATE capture_tasks SET status='timeout', failed_at_ms=?, error='任务在 30 秒内未完成' "
                      "WHERE status IN ('submitted','received') AND expires_at_ms <= ?", (now, now))
 
-    def create_task(self, device_id: str) -> dict:
+    def create_task(self, device_id: str, task_type: str) -> dict:
         now = int(time.time() * 1000)
         task = {"request_id": str(uuid.uuid4()), "device_id": device_id,
-                "task_type": "capture_full_snapshot",
-                "sensor_sources": "temperature,heap,imu,wifi,camera,lcd",
+                "task_type": task_type,
+                "sensor_sources": ("camera" if task_type == "capture_photo"
+                                   else "temperature,heap,imu,wifi,camera,lcd"),
                 "status": "submitted", "created_at_ms": now, "expires_at_ms": now + 30000}
         with self.connect() as conn:
             conn.execute("INSERT INTO capture_tasks(request_id,device_id,task_type,sensor_sources,status,created_at_ms,expires_at_ms) "
@@ -280,6 +325,7 @@ class Store:
             row = conn.execute("SELECT * FROM capture_tasks WHERE request_id=? AND device_id=?", (request_id, result.device_id)).fetchone()
             if not row: raise KeyError("任务不存在或不属于该设备")
             if row["status"] == "completed": return dict(row)
+            if row["task_type"] != "capture_full_snapshot": raise ValueError("不是传感器快照任务")
             if row["status"] not in ("submitted", "received"): raise ValueError(row["status"])
             batch = TelemetryBatch(device_id=result.device_id, samples=[result.sample])
             self._upsert_device(conn, result.device_id, result.sample.ip)
@@ -288,6 +334,61 @@ class Store:
             conn.execute("UPDATE capture_tasks SET status='completed', completed_at_ms=?, telemetry_id=? WHERE request_id=?",
                          (now, telemetry_id, request_id))
             return dict(conn.execute("SELECT * FROM capture_tasks WHERE request_id=?", (request_id,)).fetchone())
+
+    @staticmethod
+    def validate_bmp(payload: bytes) -> None:
+        if len(payload) != PHOTO_BYTE_SIZE or payload[:2] != b"BM":
+            raise ValueError("照片必须是完整的 240x240 BMP")
+        little = lambda offset, length, signed=False: int.from_bytes(payload[offset:offset + length], "little", signed=signed)
+        if (little(2, 4) != PHOTO_BYTE_SIZE or little(10, 4) != PHOTO_HEADER_SIZE or
+                little(14, 4) != 40 or little(18, 4, signed=True) != PHOTO_WIDTH or
+                abs(little(22, 4, signed=True)) != PHOTO_HEIGHT or little(26, 2) != 1 or
+                little(28, 2) != 24 or little(30, 4) != 0 or little(34, 4) != PHOTO_WIDTH * PHOTO_HEIGHT * 3):
+            raise ValueError("BMP 头或尺寸不符合 ESP32-S3-EYE 照片格式")
+
+    def complete_photo_task(self, request_id: str, device_id: str, captured_at_ms: int, payload: bytes) -> dict:
+        self.validate_bmp(payload)
+        storage_name = f"{request_id}.bmp"
+        final_path = self.photo_dir / storage_name
+        temp_path = self.photo_dir / f".{request_id}.{uuid.uuid4().hex}.upload"
+        temp_path.write_bytes(payload)
+        moved = False
+        try:
+            with self.connect() as conn:
+                self._expire_tasks(conn)
+                row = conn.execute("SELECT * FROM capture_tasks WHERE request_id=? AND device_id=?", (request_id, device_id)).fetchone()
+                if not row:
+                    raise KeyError("任务不存在或不属于该设备")
+                if row["status"] == "completed":
+                    return dict(row)
+                if row["task_type"] != "capture_photo":
+                    raise ValueError("不是拍照任务")
+                if row["status"] not in ("submitted", "received"):
+                    raise ValueError(row["status"])
+                os.replace(temp_path, final_path)
+                moved = True
+                now = int(time.time() * 1000)
+                photo_id = conn.execute(
+                    "INSERT INTO photos(request_id,device_id,captured_at_ms,received_at_ms,content_type,byte_size,sha256,storage_name) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (request_id, device_id, captured_at_ms, now, "image/bmp", len(payload),
+                     hashlib.sha256(payload).hexdigest(), storage_name),
+                ).lastrowid
+                conn.execute("UPDATE capture_tasks SET status='completed', completed_at_ms=?, photo_id=? WHERE request_id=?",
+                             (now, photo_id, request_id))
+                return dict(conn.execute("SELECT * FROM capture_tasks WHERE request_id=?", (request_id,)).fetchone())
+        except Exception:
+            if moved:
+                try:
+                    final_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def fail_task(self, request_id: str, failure: TaskFailure) -> dict:
         with self.connect() as conn:
@@ -312,6 +413,22 @@ class Store:
     def list_devices(self) -> list[dict]:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute("SELECT * FROM devices ORDER BY last_seen_at_ms DESC")]
+
+    def list_photos(self, device_id: str | None = None) -> list[dict]:
+        with self.connect() as conn:
+            if device_id:
+                rows = conn.execute("SELECT * FROM photos WHERE device_id=? ORDER BY received_at_ms DESC LIMIT 100", (device_id,))
+            else:
+                rows = conn.execute("SELECT * FROM photos ORDER BY received_at_ms DESC LIMIT 100")
+            return [dict(row) for row in rows]
+
+    def photo_path(self, photo_id: int) -> Path | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT storage_name FROM photos WHERE id=?", (photo_id,)).fetchone()
+            if not row:
+                return None
+            path = self.photo_dir / row["storage_name"]
+            return path if path.is_file() else None
 
     def query(self, start_ms: int | None, end_ms: int | None, device_id: str | None, limit: int):
         where, values = [], []
@@ -354,7 +471,7 @@ def create_app(database: Path | None = None, api_key: str | None = None) -> Fast
 
     @app.post("/api/v1/capture-tasks", status_code=201)
     def create_capture_task(request: CaptureTaskCreate):
-        return store.create_task(request.device_id)
+        return store.create_task(request.device_id, request.task_type)
 
     @app.get("/api/v1/capture-tasks")
     def get_capture_tasks(device_id: str | None = None):
@@ -389,6 +506,24 @@ def create_app(database: Path | None = None, api_key: str | None = None) -> Fast
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=f"task is {exc}") from exc
 
+    @app.post("/api/v1/capture-tasks/{request_id}/photo")
+    async def complete_capture_photo(
+        request_id: str,
+        request: Request,
+        device_id: str = Header(alias="X-Device-Id"),
+        captured_at_ms: int = Header(alias="X-Captured-At-Ms"),
+        _: None = Depends(require_api_key),
+    ):
+        if request.headers.get("content-type", "").split(";", 1)[0].lower() != "image/bmp":
+            raise HTTPException(status_code=415, detail="photo content type must be image/bmp")
+        payload = await request.body()
+        try:
+            return store.complete_photo_task(request_id, device_id, captured_at_ms, payload)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/v1/capture-tasks/{request_id}/fail")
     def fail_capture_task(request_id: str, failure: TaskFailure, _: None = Depends(require_api_key)):
         try:
@@ -407,6 +542,19 @@ def create_app(database: Path | None = None, api_key: str | None = None) -> Fast
     def set_periodic_ingestion_state(control: PeriodicIngestionControl):
         store.set_periodic_paused(control.paused)
         return {"paused": control.paused}
+
+    @app.get("/api/v1/photos")
+    def get_photos(device_id: str | None = None):
+        store.cleanup()
+        return {"photos": store.list_photos(device_id)}
+
+    @app.get("/api/v1/photos/{photo_id}/image")
+    def get_photo_image(photo_id: int):
+        store.cleanup()
+        path = store.photo_path(photo_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="photo not found or expired")
+        return FileResponse(path, media_type="image/bmp")
 
     @app.get("/api/v1/telemetry")
     def get_telemetry(

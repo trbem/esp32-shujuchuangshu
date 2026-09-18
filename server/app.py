@@ -178,6 +178,8 @@ class Store:
         self.photo_dir = self.database.parent / "photos"
         self.photo_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_lock = threading.Lock()
+        self._live_lock = threading.Lock()
+        self._live_samples: dict[str, dict] = {}
         self._last_cleanup = 0.0
         with self.connect() as conn:
             conn.executescript(SCHEMA)
@@ -280,6 +282,27 @@ class Store:
             before = conn.total_changes
             self._insert_rows(conn, batch)
             return conn.total_changes - before
+
+    def publish_live(self, batch: TelemetryBatch) -> dict:
+        """Keep one current sample per device without growing SQLite history."""
+        received_at_ms = int(time.time() * 1000)
+        sample = batch.samples[-1].model_dump()
+        sample.update(device_id=batch.device_id, received_at_ms=received_at_ms, source="live")
+        with self._live_lock:
+            self._live_samples[batch.device_id] = sample
+        with self.connect() as conn:
+            self._upsert_device(conn, batch.device_id, sample["ip"])
+        return sample
+
+    def latest_live(self, device_id: str | None = None) -> dict | None:
+        with self._live_lock:
+            if device_id:
+                sample = self._live_samples.get(device_id)
+            elif self._live_samples:
+                sample = max(self._live_samples.values(), key=lambda value: value["received_at_ms"])
+            else:
+                sample = None
+            return dict(sample) if sample else None
 
     @staticmethod
     def _expire_tasks(conn: sqlite3.Connection) -> None:
@@ -464,6 +487,15 @@ def create_app(database: Path | None = None, api_key: str | None = None) -> Fast
         store.cleanup()
         inserted = store.insert_batch(batch)
         return {"accepted": len(batch.samples), "inserted": inserted}
+
+    @app.post("/api/v1/live-telemetry", status_code=200)
+    def post_live_telemetry(batch: TelemetryBatch, _: None = Depends(require_api_key)):
+        sample = store.publish_live(batch)
+        return {"accepted": len(batch.samples), "received_at_ms": sample["received_at_ms"]}
+
+    @app.get("/api/v1/live-telemetry")
+    def get_live_telemetry(device_id: str | None = None):
+        return {"sample": store.latest_live(device_id)}
 
     @app.get("/api/v1/devices")
     def get_devices():

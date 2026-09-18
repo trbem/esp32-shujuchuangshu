@@ -113,6 +113,17 @@ idf.py -p COM5 flash
 设备以每批最多 20 条的方式补传。服务器以 `(device_id, boot_id, sequence)` 去重，因此重传不会
 产生重复记录。队列写满时会淘汰最旧尚未上传的数据，并在 `/data` 中报告 `telemetry_dropped`。
 
+### 实时数据传输
+
+除可靠历史队列外，固件还每 **1 秒**向 `/api/v1/live-telemetry` 发送一条当前快照。服务器只在内存中
+保留每台设备的最新一条，历史页的「实时数据」区域会每秒自动更新温度和三轴加速度的最近 120 个点。
+因此实时查看不会把 SQLite 的 30 天历史和 Flash 队列放大为高频数据；实时链路短暂断开时只丢失该瞬时
+更新，5 秒可靠队列仍会保存并补传历史观测。它不传输相机画面。
+
+在 `idf.py menuconfig` 的 **Sensor Dashboard Configuration** 中，可用 `Live telemetry upload interval (ms)`
+调整实时上报周期（默认 1000 ms，范围 500–60000 ms）。实时页面显示的「传输延迟」是浏览器当前时间与
+服务器收到该快照的时间差；服务刚重启或开发板离线时会显示等待实时上报。
+
 ### 启动服务
 
 ```powershell

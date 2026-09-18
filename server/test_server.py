@@ -59,6 +59,21 @@ class ServerTests(unittest.TestCase):
         self.assertIn('temp_c', self.client.get('/api/v1/export.csv').text)
         self.assertIn('<title>ESP32', self.client.get('/').text)
 
+    def test_live_telemetry_is_authenticated_current_and_not_historical(self):
+        headers = {"X-Api-Key": "test-key"}
+        self.assertEqual(self.client.post("/api/v1/live-telemetry", json=self.payload).status_code, 401)
+        received = self.client.post("/api/v1/live-telemetry", json=self.payload, headers=headers)
+        self.assertEqual(received.status_code, 200)
+        live = self.client.get("/api/v1/live-telemetry?device_id=s3eye-001").json()["sample"]
+        self.assertEqual((live["device_id"], live["temp_c"], live["source"]), ("s3eye-001", 25.5, "live"))
+        self.assertIn("received_at_ms", live)
+        self.assertEqual(len(self.client.get('/api/v1/telemetry').json()["samples"]), 0)
+
+        newer = json.loads(json.dumps(self.payload))
+        newer["samples"][0].update(sequence=2, temp_c=26.5)
+        self.client.post("/api/v1/live-telemetry", json=newer, headers=headers)
+        self.assertEqual(self.client.get("/api/v1/live-telemetry?device_id=s3eye-001").json()["sample"]["temp_c"], 26.5)
+
     def test_lcd_counters_are_optional_and_persisted(self):
         """Older firmware omits lcd_frames/lcd_fps; newer firmware sends them.
         Both must be accepted, and the values must survive into SQLite."""

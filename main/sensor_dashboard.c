@@ -200,6 +200,9 @@ static size_t s_queue_depth;
 static uint32_t s_queue_dropped;
 static bool s_upload_ok;
 static int64_t s_last_upload_ms;
+static uint32_t s_live_sequence;
+static bool s_live_upload_ok;
+static int64_t s_last_live_upload_ms;
 static char s_active_task_id[37];
 static bool s_task_result_pending;
 static telemetry_snapshot_t s_task_result_sample;
@@ -938,6 +941,50 @@ static bool tlm_post_batch(const telemetry_record_t *records, size_t count)
     return err == ESP_OK && status >= 200 && status < 300;
 }
 
+/* This uses the same schema and authentication as durable telemetry, but the
+ * destination only retains the latest sample in RAM.  It is deliberately not
+ * put in the Flash queue: a missed live update is harmless, whereas filling
+ * the durable queue at display refresh rate would make recovery slower. */
+static bool tlm_post_live_snapshot(const telemetry_snapshot_t *sample)
+{
+    char body[1536];
+    int written = snprintf(body, sizeof(body),
+        "{\"device_id\":\"%s\",\"samples\":[{\"boot_id\":\"%016" PRIx64
+        "\",\"sequence\":%" PRIu32 ",\"captured_at_ms\":%" PRId64
+        ",\"temp_c\":%.2f,\"heap_int\":%" PRIu32 ",\"heap_psram\":%" PRIu32
+        ",\"fps\":%.2f,\"jpeg\":%" PRIu32 ",\"accel_ok\":%s,\"accel_x_g\":%.4f"
+        ",\"accel_y_g\":%.4f,\"accel_z_g\":%.4f,\"accel_mag_g\":%.4f"
+        ",\"accel_range_g\":4,\"accel_id\":\"0x%02X\",\"accel_chip\":\"%s\""
+        ",\"uptime_s\":%" PRIu32 ",\"cpu_mhz\":%" PRIu32 ",\"rssi\":%" PRId32
+        ",\"lcd_frames\":%" PRIu32 ",\"lcd_fps\":%.2f,\"lcd_err\":%" PRIu32
+        ",\"ip\":\"%s\"}]}",
+        CONFIG_SENSOR_DASH_DEVICE_ID, s_boot_id, ++s_live_sequence,
+        sample->captured_at_ms, sample->temp_c, sample->heap_int, sample->heap_psram,
+        sample->fps, sample->jpeg, sample->accel_ok ? "true" : "false",
+        sample->accel_x_g, sample->accel_y_g, sample->accel_z_g, sample->accel_mag_g,
+        sample->accel_id, qma_chip_name(sample->accel_id), sample->uptime_s,
+        sample->cpu_mhz, sample->rssi, sample->lcd_frames, sample->lcd_fps,
+        sample->lcd_err, sample->ip);
+    if (written < 0 || (size_t)written >= sizeof(body)) return false;
+
+    const char *api = strstr(CONFIG_SENSOR_DASH_COLLECTOR_URL, "/api/v1/");
+    size_t base_len = api ? (size_t)(api - CONFIG_SENSOR_DASH_COLLECTOR_URL)
+                          : strlen(CONFIG_SENSOR_DASH_COLLECTOR_URL);
+    char url[192];
+    snprintf(url, sizeof(url), "%.*s/api/v1/live-telemetry", (int)base_len,
+             CONFIG_SENSOR_DASH_COLLECTOR_URL);
+    esp_http_client_config_t config = {.url = url, .method = HTTP_METHOD_POST, .timeout_ms = 3000};
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) return false;
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Api-Key", CONFIG_SENSOR_DASH_COLLECTOR_API_KEY);
+    esp_http_client_set_post_field(client, body, written);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    return err == ESP_OK && status >= 200 && status < 300;
+}
+
 static void telemetry_upload_task(void *arg)
 {
     const TickType_t delay = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_UPLOAD_INTERVAL_MS);
@@ -960,6 +1007,22 @@ static void telemetry_upload_task(void *arg)
                 s_last_upload_ms = tlm_now_ms();
             }
         }
+    }
+}
+
+static void live_telemetry_task(void *arg)
+{
+    const TickType_t delay = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_LIVE_UPLOAD_INTERVAL_MS);
+    while (true) {
+        vTaskDelay(delay);
+        if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT)) continue;
+        telemetry_snapshot_t sample;
+        xSemaphoreTake(s_tlm_lock, portMAX_DELAY);
+        sample = s_latest_sample;
+        xSemaphoreGive(s_tlm_lock);
+        if (!sample.uptime_s) continue;
+        s_live_upload_ok = tlm_post_live_snapshot(&sample);
+        if (s_live_upload_ok) s_last_live_upload_ms = tlm_now_ms();
     }
 }
 
@@ -1418,6 +1481,9 @@ void app_main(void)
     if (xTaskCreate(telemetry_upload_task, "telemetry_upload", 8192, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "telemetry_upload task creation failed - nothing will reach the collector");
     }
+    if (xTaskCreate(live_telemetry_task, "live_telemetry", 6144, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "live_telemetry task creation failed - web live updates unavailable");
+    }
     if (xTaskCreate(capture_task_poll_task, "capture_task_poll", 8192, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "capture_task_poll task creation failed - on-demand capture unavailable");
     }
@@ -1492,7 +1558,8 @@ void app_main(void)
                  "\"uptime_s\":%lu,\"cpu_mhz\":%lu,\"rssi\":%d,\"ip\":\"%s\","
                  "\"lcd_frames\":%lu,\"lcd_fps\":%.1f,\"lcd_err\":%lu,"
                  "\"telemetry_queue\":%u,\"telemetry_dropped\":%lu,"
-                 "\"upload_ok\":%s,\"last_upload_ms\":%lld}",
+                 "\"upload_ok\":%s,\"last_upload_ms\":%lld,"
+                 "\"live_upload_ok\":%s,\"last_live_upload_ms\":%lld}",
                  temp_c,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),   /* internal SRAM only */
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -1509,7 +1576,9 @@ void app_main(void)
                  (unsigned)s_queue_depth,
                  (unsigned long)s_queue_dropped,
                  s_upload_ok ? "true" : "false",
-                 (long long)s_last_upload_ms);
+                 (long long)s_last_upload_ms,
+                 s_live_upload_ok ? "true" : "false",
+                 (long long)s_last_live_upload_ms);
         xSemaphoreGive(s_json_lock);
 
         telemetry_snapshot_t sample = {

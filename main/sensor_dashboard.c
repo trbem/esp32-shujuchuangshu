@@ -19,6 +19,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <sys/time.h>
 #include <inttypes.h>
 #include <stddef.h>
@@ -39,9 +40,11 @@
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_partition.h"
 #include "esp_netif_sntp.h"
 #include "esp_cache.h"
+#include "esp_mac.h"
 #include "mdns.h"
 #include "driver/temperature_sensor.h"
 #include "driver/i2c_master.h"
@@ -118,13 +121,20 @@ extern const char _binary_dashboard_html_start[];
 extern const char _binary_dashboard_html_end[];
 #define DASHBOARD_HTML_LEN  ((size_t)(_binary_dashboard_html_end - _binary_dashboard_html_start))
 
-#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_CONNECTED_BIT          BIT0
+#define WIFI_PROVISION_REQUEST_BIT  BIT1
+#define WIFI_PROVISION_SUBMIT_BIT   BIT2
 
 static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t  s_json_lock;
 static char s_json[768] = "{\"ready\":false}";
 static char s_ip[16] = "";
 static int  s_rssi = 0;
+static bool s_wifi_runtime;
+static uint8_t s_wifi_failures;
+static httpd_handle_t s_provision_server;
+static char s_pending_ssid[33];
+static char s_pending_password[65];
 
 /* The Flash journal is deliberately independent from NVS: each record has a
  * CRC and an acknowledged bit, so a reset while writing or uploading can be
@@ -620,17 +630,207 @@ static bool qma_read_accel(float *x_g, float *y_g, float *z_g)
 
 /* ------------------------- Wi-Fi ------------------------- */
 
+typedef struct {
+    char ssid[33];
+    char password[65];
+} wifi_credentials_t;
+
+#define WIFI_NVS_NAMESPACE "wifi_config"
+#define WIFI_NVS_KEY       "station"
+
+static const char s_provision_page[] =
+    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>ESP32 Wi-Fi 配网</title><style>body{font:16px system-ui;margin:24px;max-width:480px}"
+    "input,select,button{box-sizing:border-box;width:100%;padding:12px;margin:8px 0}small{color:#555}</style>"
+    "<h2>ESP32 Wi-Fi 配网</h2><p>请选择 2.4 GHz 网络，设备连接成功后此热点会关闭。</p>"
+    "<form id=f><select id=ssid name=ssid><option value=''>正在扫描…</option></select>"
+    "<input id=other placeholder='或手工输入 SSID'><input type=password name=password placeholder='Wi-Fi 密码（开放网络可留空）'>"
+    "<button>保存并连接</button></form><small id=msg></small><script>"
+    "fetch('/scan').then(r=>r.text()).then(t=>{let s=document.querySelector('#ssid');s.innerHTML='';"
+    "t.split('\\n').filter(Boolean).forEach(v=>{let o=document.createElement('option');o.textContent=v;o.value=v;s.append(o)})})"
+    ".catch(()=>msg.textContent='扫描失败，可手工输入 SSID');"
+    "f.onsubmit=async e=>{e.preventDefault();let d=new FormData(f),v=other.value.trim();if(v)d.set('ssid',v);"
+    "msg.textContent='正在连接，请稍候…';let r=await fetch('/save',{method:'POST',body:new URLSearchParams(d)});"
+    "msg.textContent=await r.text()};</script>";
+
+static bool wifi_load_credentials(wifi_credentials_t *credentials)
+{
+    nvs_handle_t nvs;
+    size_t length = sizeof(*credentials);
+    if (nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return false;
+    esp_err_t err = nvs_get_blob(nvs, WIFI_NVS_KEY, credentials, &length);
+    nvs_close(nvs);
+    return err == ESP_OK && length == sizeof(*credentials) && credentials->ssid[0] != '\0';
+}
+
+static bool wifi_save_credentials(const wifi_credentials_t *credentials)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return false;
+    esp_err_t err = nvs_set_blob(nvs, WIFI_NVS_KEY, credentials, sizeof(*credentials));
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err == ESP_OK;
+}
+
+static void form_url_decode(char *out, size_t out_len, const char *value)
+{
+    size_t used = 0;
+    while (*value && *value != '&' && used + 1 < out_len) {
+        if (*value == '+' ) {
+            out[used++] = ' ';
+            ++value;
+        } else if (*value == '%' && value[1] && value[2]) {
+            int hi = isdigit((unsigned char)value[1]) ? value[1] - '0' : (tolower((unsigned char)value[1]) - 'a' + 10);
+            int lo = isdigit((unsigned char)value[2]) ? value[2] - '0' : (tolower((unsigned char)value[2]) - 'a' + 10);
+            if (hi >= 0 && hi < 16 && lo >= 0 && lo < 16) {
+                out[used++] = (char)((hi << 4) | lo);
+                value += 3;
+            } else {
+                out[used++] = *value++;
+            }
+        } else {
+            out[used++] = *value++;
+        }
+    }
+    out[used] = '\0';
+}
+
+static void form_value(const char *form, const char *name, char *out, size_t out_len)
+{
+    size_t key_len = strlen(name);
+    out[0] = '\0';
+    while (form && *form) {
+        if (!strncmp(form, name, key_len) && form[key_len] == '=') {
+            form_url_decode(out, out_len, form + key_len + 1);
+            return;
+        }
+        form = strchr(form, '&');
+        if (form) ++form;
+    }
+}
+
+static esp_err_t provision_index_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_send(req, s_provision_page, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t provision_scan_handler(httpd_req_t *req)
+{
+    wifi_scan_config_t scan = {.show_hidden = true};
+    uint16_t count = 12;
+    wifi_ap_record_t records[12];
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    if (esp_wifi_scan_start(&scan, true) != ESP_OK || esp_wifi_scan_get_ap_records(&count, records) != ESP_OK) {
+        httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    for (uint16_t i = 0; i < count; ++i) {
+        const char *ssid = (const char *)records[i].ssid;
+        if (!ssid[0]) continue;
+        httpd_resp_send_chunk(req, ssid, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(req, "\n", 1);
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t provision_save_handler(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len >= 192) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "配网数据无效");
+        return ESP_OK;
+    }
+    char form[192];
+    int received = httpd_req_recv(req, form, req->content_len);
+    if (received != req->content_len) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "未收到完整配网数据");
+        return ESP_OK;
+    }
+    form[received] = '\0';
+    form_value(form, "ssid", s_pending_ssid, sizeof(s_pending_ssid));
+    form_value(form, "password", s_pending_password, sizeof(s_pending_password));
+    if (!s_pending_ssid[0] || strlen(s_pending_password) > 63) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID 或密码无效");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_sendstr(req, "正在尝试连接。成功后配置热点会自动关闭；失败后请返回重试。");
+    xEventGroupSetBits(s_wifi_event_group, WIFI_PROVISION_SUBMIT_BIT);
+    return ESP_OK;
+}
+
+static void wifi_start_provision_server(void)
+{
+    if (s_provision_server) return;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 6;
+    config.uri_match_fn = httpd_uri_match_wildcard;
+    ESP_ERROR_CHECK(httpd_start(&s_provision_server, &config));
+    httpd_uri_t scan = {.uri = "/scan", .method = HTTP_GET, .handler = provision_scan_handler};
+    httpd_uri_t save = {.uri = "/save", .method = HTTP_POST, .handler = provision_save_handler};
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_provision_server, &scan));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_provision_server, &save));
+    httpd_uri_t root = {.uri = "/*", .method = HTTP_GET, .handler = provision_index_handler};
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_provision_server, &root));
+}
+
+static void wifi_start_provisioning(void)
+{
+    uint8_t mac[6];
+    char ssid[33];
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(ssid, sizeof(ssid), "S3EYE-Setup-%02X%02X%02X", mac[3], mac[4], mac[5]);
+    wifi_config_t config = {0};
+    strncpy((char *)config.ap.ssid, ssid, sizeof(config.ap.ssid) - 1);
+    strncpy((char *)config.ap.password, CONFIG_SENSOR_DASH_PROVISION_PASSWORD, sizeof(config.ap.password) - 1);
+    config.ap.ssid_len = strlen(ssid);
+    config.ap.max_connection = 1;
+    config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &config));
+    wifi_start_provision_server();
+    ESP_LOGW(TAG, "Wi-Fi setup hotspot %s ready at http://192.168.4.1/", ssid);
+}
+
+static bool wifi_connect_and_wait(const wifi_credentials_t *credentials, TickType_t timeout)
+{
+    wifi_config_t config = {0};
+    strncpy((char *)config.sta.ssid, credentials->ssid, sizeof(config.sta.ssid) - 1);
+    strncpy((char *)config.sta.password, credentials->password, sizeof(config.sta.password) - 1);
+    config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_PROVISION_REQUEST_BIT);
+    s_wifi_failures = 0;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &config));
+    esp_wifi_connect();
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_PROVISION_REQUEST_BIT,
+                                           pdFALSE, pdFALSE, timeout);
+    return (bits & WIFI_CONNECTED_BIT) != 0;
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "Wi-Fi started, connecting to %s ...", CONFIG_SENSOR_DASH_WIFI_SSID);
+        ESP_LOGI(TAG, "Wi-Fi started");
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi disconnected, retrying...");
-        esp_wifi_connect();
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        if (++s_wifi_failures < 3) {
+            ESP_LOGW(TAG, "Wi-Fi disconnected, retrying (%u/3)", (unsigned)s_wifi_failures);
+            esp_wifi_connect();
+        } else if (s_wifi_runtime) {
+            ESP_LOGW(TAG, "Wi-Fi unavailable; restarting into local setup mode");
+            esp_restart();
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_PROVISION_REQUEST_BIT);
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_failures = 0;
         ESP_LOGI(TAG, "got IP: %s", s_ip);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -643,6 +843,7 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -650,14 +851,17 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
-    wifi_config_t wifi_config = {0};
-    /* ESP32-S3 is 2.4 GHz only - the AP must broadcast on 2.4 GHz */
-    strncpy((char *)wifi_config.sta.ssid, CONFIG_SENSOR_DASH_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, CONFIG_SENSOR_DASH_WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* accept WPA/WPA2/WPA3 */
-
+    wifi_credentials_t credentials = {0};
+    if (!wifi_load_credentials(&credentials)) {
+        strncpy(credentials.ssid, CONFIG_SENSOR_DASH_WIFI_SSID, sizeof(credentials.ssid) - 1);
+        strncpy(credentials.password, CONFIG_SENSOR_DASH_WIFI_PASSWORD, sizeof(credentials.password) - 1);
+    }
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    wifi_config_t initial = {0};
+    strncpy((char *)initial.sta.ssid, credentials.ssid, sizeof(initial.sta.ssid) - 1);
+    strncpy((char *)initial.sta.password, credentials.password, sizeof(initial.sta.password) - 1);
+    initial.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &initial));
     ESP_ERROR_CHECK(esp_wifi_start());
     /* Modem sleep parks the radio between beacons and inflates the TCP round-trip
      * to ~45 ms, which caps a single stream at snd_buf/RTT.  /shot pushes an
@@ -665,8 +869,29 @@ static void wifi_init_sta(void)
      * USB powered and the extra draw buys a several-fold throughput gain. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-    ESP_LOGI(TAG, "waiting for Wi-Fi (%s)...", CONFIG_SENSOR_DASH_WIFI_SSID);
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "waiting for Wi-Fi (%s)...", credentials.ssid);
+    if (!wifi_connect_and_wait(&credentials, pdMS_TO_TICKS(30000))) {
+        wifi_start_provisioning();
+        while (true) {
+            xEventGroupWaitBits(s_wifi_event_group, WIFI_PROVISION_SUBMIT_BIT, pdTRUE, pdTRUE, portMAX_DELAY);
+            wifi_credentials_t candidate = {0};
+            strncpy(candidate.ssid, s_pending_ssid, sizeof(candidate.ssid) - 1);
+            strncpy(candidate.password, s_pending_password, sizeof(candidate.password) - 1);
+            if (wifi_connect_and_wait(&candidate, pdMS_TO_TICKS(30000))) {
+                if (!wifi_save_credentials(&candidate)) ESP_LOGW(TAG, "Wi-Fi connected but saving credentials failed");
+                if (s_provision_server) {
+                    httpd_stop(s_provision_server);
+                    s_provision_server = NULL;
+                }
+                ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+                break;
+            }
+            ESP_LOGW(TAG, "Wi-Fi setup failed; returning to setup hotspot");
+        }
+    } else if (!wifi_save_credentials(&credentials)) {
+        ESP_LOGW(TAG, "Wi-Fi connected but saving credentials failed");
+    }
+    s_wifi_runtime = true;
 }
 
 /* ------------------- Persistent telemetry queue ------------------- */
@@ -897,8 +1122,22 @@ static void tlm_start_sntp(void)
     }
 }
 
+static bool collector_uses_https(void)
+{
+    return !strncmp(CONFIG_SENSOR_DASH_COLLECTOR_URL, "https://", strlen("https://"));
+}
+
+static void collector_tls_config(esp_http_client_config_t *config)
+{
+    /* The public Tunnel certificate must be validated.  Never turn this into
+     * skip_cert_common_name_check: an API key does not protect against an
+     * active network attacker that can impersonate the collector. */
+    config->crt_bundle_attach = esp_crt_bundle_attach;
+}
+
 static bool tlm_post_batch(const telemetry_record_t *records, size_t count)
 {
+    if (!collector_uses_https()) return false;
     char *body = heap_caps_malloc(12288, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (body == NULL) body = malloc(12288);
     if (body == NULL) return false;
@@ -929,6 +1168,7 @@ static bool tlm_post_batch(const telemetry_record_t *records, size_t count)
     snprintf(body + used, 12288 - used, "]}");
     esp_http_client_config_t config = {.url = CONFIG_SENSOR_DASH_COLLECTOR_URL,
                                        .method = HTTP_METHOD_POST, .timeout_ms = 5000};
+    collector_tls_config(&config);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) { free(body); return false; }
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -947,6 +1187,7 @@ static bool tlm_post_batch(const telemetry_record_t *records, size_t count)
  * the durable queue at display refresh rate would make recovery slower. */
 static bool tlm_post_live_snapshot(const telemetry_snapshot_t *sample)
 {
+    if (!collector_uses_https()) return false;
     char body[1536];
     int written = snprintf(body, sizeof(body),
         "{\"device_id\":\"%s\",\"samples\":[{\"boot_id\":\"%016" PRIx64
@@ -974,6 +1215,7 @@ static bool tlm_post_live_snapshot(const telemetry_snapshot_t *sample)
     snprintf(url, sizeof(url), "%.*s/api/v1/live-telemetry", (int)base_len,
              CONFIG_SENSOR_DASH_COLLECTOR_URL);
     esp_http_client_config_t config = {.url = url, .method = HTTP_METHOD_POST, .timeout_ms = 3000};
+    collector_tls_config(&config);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) return false;
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -1060,10 +1302,12 @@ static void task_url(char *out, size_t out_len, const char *path)
 static bool task_http_request(const char *url, esp_http_client_method_t method, const char *body,
                               char *response_buf, size_t response_len)
 {
+    if (!collector_uses_https()) return false;
     task_http_response_t response = {.buf = response_buf, .cap = response_len, .len = 0};
     if (response_buf && response_len) response_buf[0] = '\0';
     esp_http_client_config_t config = {.url = url, .method = method, .timeout_ms = 5000,
                                        .event_handler = task_http_event, .user_data = &response};
+    collector_tls_config(&config);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) return false;
     esp_http_client_set_header(client, "X-Api-Key", CONFIG_SENSOR_DASH_COLLECTOR_API_KEY);
@@ -1129,6 +1373,7 @@ static bool task_post_failure(const char *request_id, const char *error)
 
 static bool task_post_photo(const char *request_id, int64_t captured_at_ms)
 {
+    if (!collector_uses_https()) return false;
     if (s_photo_bmp == NULL) return false;
     char url[192], captured_at[32];
     task_url(url, sizeof(url), "/api/v1/capture-tasks/");
@@ -1137,6 +1382,7 @@ static bool task_post_photo(const char *request_id, int64_t captured_at_ms)
     snprintf(captured_at, sizeof(captured_at), "%" PRId64, captured_at_ms);
 
     esp_http_client_config_t config = {.url = url, .method = HTTP_METHOD_POST, .timeout_ms = 10000};
+    collector_tls_config(&config);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) return false;
     esp_http_client_set_header(client, "Content-Type", "image/bmp");

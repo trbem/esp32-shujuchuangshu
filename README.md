@@ -124,6 +124,52 @@ idf.py -p COM5 flash
 调整实时上报周期（默认 1000 ms，范围 500–60000 ms）。实时页面显示的「传输延迟」是浏览器当前时间与
 服务器收到该快照的时间差；服务刚重启或开发板离线时会显示等待实时上报。
 
+### 手机网页配网
+
+Wi-Fi 凭据首次仍从 git-ignore 的 `sdkconfig` 读取；成功连接后会保存在板载 NVS。若该网络连续 3 次
+连接失败（例如把开发板带离原网络），设备会启动一个 WPA2 配置热点：
+
+- SSID：`S3EYE-Setup-<MAC后六位>`
+- 地址：`http://192.168.4.1/`
+- 密码：`Local Wi-Fi setup hotspot password`，在 menuconfig 的 **Sensor Dashboard Configuration** 设置；
+  真实密码只在 git-ignore 的 `sdkconfig` 中保存。
+
+手机连接这个热点后打开上述地址，选择扫描到的网络或手工填写 SSID 和密码。ESP32-S3 仅支持 **2.4 GHz**，
+因此手机热点也必须开启 2.4 GHz。新凭据只有取得 DHCP 地址后才会写入 NVS；密码错误时旧凭据保留，热点继续
+等待重新填写。配网完成后热点会关闭。切网时实时点暂时中断，但 Flash 里的可靠遥测仍会在重新联网后补传。
+
+### 跨网远程访问（Cloudflare Tunnel）
+
+不要将电脑的 8080 端口映射到公网。使用一个已经托管到 Cloudflare 的域名，并在一个 Tunnel 内配置两个
+Public Hostname，均转发到 `http://127.0.0.1:8080`：
+
+| 主机名 | 用途 | Cloudflare 访问策略 |
+|---|---|---|
+| `dashboard.<你的域名>` | 网页、历史、任务、照片 | Cloudflare Access：只允许你的邮箱一次性验证码登录 |
+| `ingest.<你的域名>` | ESP32 上传、任务轮询与结果 | 不启用 Access；服务端仅放行携带 `X-Api-Key` 的设备接口 |
+
+在 `server/.env` 设置两个主机名（不要提交）：
+
+```ini
+REMOTE_DASHBOARD_HOST=dashboard.example.com
+REMOTE_INGEST_HOST=ingest.example.com
+```
+
+然后在 ESP-IDF 的 menuconfig 将 `Telemetry collector URL` 设置为
+`https://ingest.<你的域名>/api/v1/telemetry`。固件会强制 HTTPS 并用 ESP x509 证书包验证服务端证书；
+不再使用 `http://` 局域网地址。ESP32 可以连接任意可上网的 Wi-Fi 或手机热点，电脑与开发板不必在同一网络。
+
+首次安装完 Python 依赖后，以管理员 PowerShell 执行：
+
+```powershell
+# 已在 Cloudflare 创建 Tunnel、两个 Public Hostname 和 Access 策略后
+.\server\install-cloudflare-tunnel.ps1 -TunnelToken '<Cloudflare Tunnel token>'
+.\server\install-autostart.ps1
+```
+
+前者安装 cloudflared 的 Windows 服务，后者创建开机启动的本机 FastAPI 任务。生产服务只监听
+`127.0.0.1:8080`，Tunnel 是唯一公网入口。Cloudflare Token、API 密钥、域名和 Wi-Fi 密码均不得提交 Git。
+
 ### 启动服务
 
 ```powershell

@@ -74,6 +74,17 @@ class ServerTests(unittest.TestCase):
         self.client.post("/api/v1/live-telemetry", json=newer, headers=headers)
         self.assertEqual(self.client.get("/api/v1/live-telemetry?device_id=s3eye-001").json()["sample"]["temp_c"], 26.5)
 
+    def test_remote_ingest_host_only_exposes_authenticated_device_endpoints(self):
+        client = TestClient(create_app(self.db, "test-key", dashboard_host="dashboard.example.test",
+                                       ingest_host="ingest.example.test"))
+        device_headers = {"Host": "ingest.example.test", "X-Api-Key": "test-key"}
+        self.assertEqual(client.post("/api/v1/telemetry", json=self.payload, headers=device_headers).status_code, 200)
+        self.assertEqual(client.get("/api/v1/telemetry", headers={"Host": "ingest.example.test"}).status_code, 404)
+        self.assertEqual(client.post("/api/v1/capture-tasks", json={"device_id": "s3eye-001"},
+                                     headers={"Host": "ingest.example.test"}).status_code, 404)
+        self.assertEqual(client.get("/", headers={"Host": "dashboard.example.test"}).status_code, 200)
+        self.assertEqual(client.get("/", headers={"Host": "unknown.example.test"}).status_code, 421)
+
     def test_lcd_counters_are_optional_and_persisted(self):
         """Older firmware omits lcd_frames/lcd_fps; newer firmware sends them.
         Both must be accepted, and the values must survive into SQLite."""

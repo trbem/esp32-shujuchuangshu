@@ -12,6 +12,14 @@ menu "Sensor Dashboard Configuration"
         string "Wi-Fi password"
         default "YOUR_WIFI_PASSWORD"
 
+    config SENSOR_DASH_PROVISION_PASSWORD
+        string "Local Wi-Fi setup hotspot password"
+        default "CHANGE_ME_SETUP_PASSWORD"
+        help
+            WPA2 password for the temporary S3EYE-Setup-* hotspot used when
+            station connection fails.  Set a private password in the ignored
+            sdkconfig before shipping or using remote deployment.
+
     config SENSOR_DASH_INTERVAL_MS
         int "Sampling / report interval (ms)"
         default 500
@@ -20,9 +28,12 @@ menu "Sensor Dashboard Configuration"
 
     config SENSOR_DASH_COLLECTOR_URL
         string "Telemetry collector URL"
-        default "http://192.168.1.100:8080/api/v1/telemetry"
+        default "https://ingest.example.com/api/v1/telemetry"
         help
-            Set this to the LAN address of the computer running the telemetry server.
+            Set this to the HTTPS ingest hostname of the computer running the
+            telemetry server, for example
+            https://ingest.example.com/api/v1/telemetry.  Production firmware
+            rejects plain HTTP so device data and API keys are not exposed.
 
     config SENSOR_DASH_COLLECTOR_API_KEY
         string "Telemetry collector API key"

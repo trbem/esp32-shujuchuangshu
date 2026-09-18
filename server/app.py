@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -471,9 +471,14 @@ class Store:
             return [dict(row) for row in conn.execute(sql, values)]
 
 
-def create_app(database: Path | None = None, api_key: str | None = None) -> FastAPI:
+def create_app(database: Path | None = None, api_key: str | None = None,
+               dashboard_host: str | None = None, ingest_host: str | None = None) -> FastAPI:
     store = Store(database or ROOT / "data" / "telemetry.sqlite3")
     key = api_key or os.environ.get("TELEMETRY_API_KEY", "CHANGE_ME")
+    dashboard_host = (dashboard_host or os.environ.get("REMOTE_DASHBOARD_HOST", "")).lower().strip()
+    ingest_host = (ingest_host or os.environ.get("REMOTE_INGEST_HOST", "")).lower().strip()
+    if bool(dashboard_host) != bool(ingest_host):
+        raise RuntimeError("REMOTE_DASHBOARD_HOST and REMOTE_INGEST_HOST must be set together")
     app = FastAPI(title="ESP32 Telemetry Collector", version="1.0")
     app.state.store = store
     app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
@@ -481,6 +486,30 @@ def create_app(database: Path | None = None, api_key: str | None = None) -> Fast
     def require_api_key(provided: str | None = Header(default=None, alias="X-Api-Key")) -> None:
         if not provided or not __import__("hmac").compare_digest(provided, key):
             raise HTTPException(status_code=401, detail="invalid API key")
+
+    def is_device_endpoint(request: Request) -> bool:
+        path, method = request.url.path, request.method
+        if method == "POST" and path in ("/api/v1/telemetry", "/api/v1/live-telemetry"):
+            return True
+        if method == "GET" and path.startswith("/api/v1/devices/") and path.endswith("/tasks/next"):
+            return True
+        return (method == "POST" and path.startswith("/api/v1/capture-tasks/") and
+                path.rsplit("/", 1)[-1] in {"ack", "result", "photo", "fail"})
+
+    @app.middleware("http")
+    async def isolate_remote_hosts(request: Request, call_next):
+        """The dashboard is protected by Cloudflare Access; the ingest host is
+        deliberately smaller and relies on the ESP32 API key for every route."""
+        if not dashboard_host:
+            return await call_next(request)  # local development / existing LAN deployment
+        host = request.headers.get("host", "").split(":", 1)[0].lower()
+        if host == dashboard_host:
+            return await call_next(request)
+        if host == ingest_host:
+            if is_device_endpoint(request):
+                return await call_next(request)
+            return JSONResponse(status_code=404, content={"detail": "not available on ingest host"})
+        return JSONResponse(status_code=421, content={"detail": "unknown host"})
 
     @app.post("/api/v1/telemetry", status_code=200)
     def post_telemetry(batch: TelemetryBatch, _: None = Depends(require_api_key)):

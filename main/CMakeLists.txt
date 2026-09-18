@@ -16,6 +16,7 @@ idf_component_register(
         esp_event
         esp_http_server
         esp_http_client
+        mbedtls
         esp_partition
         mdns
         nvs_flash

@@ -35,6 +35,14 @@ menu "Sensor Dashboard Configuration"
             https://ingest.example.com/api/v1/telemetry.  Production firmware
             rejects plain HTTP so device data and API keys are not exposed.
 
+    config SENSOR_DASH_ALLOW_INSECURE_LAN
+        bool "Allow HTTP collector for LAN-only testing"
+        default n
+        help
+            Keep disabled for production and all public networks. Enable only
+            in the git-ignored local sdkconfig when testing against a private
+            LAN FastAPI service that does not have TLS yet.
+
     config SENSOR_DASH_COLLECTOR_API_KEY
         string "Telemetry collector API key"
         default "CHANGE_ME"

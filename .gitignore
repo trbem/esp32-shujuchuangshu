@@ -30,3 +30,4 @@ __pycache__/
 server/.env
 server/.venv/
 server/data/
+flash-backups/

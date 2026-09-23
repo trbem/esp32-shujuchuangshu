@@ -4,6 +4,7 @@ idf_component_register(
     EMBED_TXTFILES "dashboard.html"
     REQUIRES
         esp_driver_cam
+        esp_driver_gpio
         esp_driver_i2c
         esp_driver_ledc
         esp_driver_spi
@@ -11,6 +12,7 @@ idf_component_register(
         esp_lcd
         esp_psram
         esp_timer
+        esp_adc
         esp_wifi
         esp_netif
         esp_event

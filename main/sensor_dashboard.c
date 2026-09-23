@@ -48,6 +48,7 @@
 #include "mdns.h"
 #include "driver/temperature_sensor.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "esp_cam_ctlr.h"
 #include "esp_cam_ctlr_dvp.h"
 #include "hal/cam_ctlr_types.h"
@@ -55,6 +56,7 @@
 #include "qma6100p.h"
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -95,6 +97,15 @@ static const char *TAG = "sensor_dash";
 #define LCD_BL_LEDC_TIMER       (LEDC_TIMER_1)
 #define LCD_BL_LEDC_CHANNEL     (LEDC_CHANNEL_0)
 
+/* The S3-EYE keypad is a resistor ladder on ADC1 channel 0 (GPIO1).  GPIO0 is
+ * the BOOT strapping button and deliberately remains untouched. GPIO3 drives
+ * the on-board green LED and must be open-drain / active-low. */
+#define INTERACTION_LED_IO              GPIO_NUM_3
+#define INTERACTION_BUTTON_ADC_CHANNEL  ADC_CHANNEL_0
+#define INTERACTION_BUTTON_POLL_MS      20
+#define INTERACTION_BUTTON_DEBOUNCE_US  60000LL
+#define INTERACTION_BUTTON_LONG_US      1500000LL
+
 /* ------------- capture format ------------- */
 /* The DVP controller captures raw RGB565 at the panel's native 240x240 so the
  * LCD gets a smooth 25 fps viewfinder.  ESP32-S3 has no JPEG encoder, therefore
@@ -127,7 +138,7 @@ extern const char _binary_dashboard_html_end[];
 
 static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t  s_json_lock;
-static char s_json[768] = "{\"ready\":false}";
+static char s_json[1280] = "{\"ready\":false}";
 static char s_ip[16] = "";
 static int  s_rssi = 0;
 static bool s_wifi_runtime;
@@ -219,6 +230,51 @@ static telemetry_snapshot_t s_task_result_sample;
 static char s_photo_task_id[37];
 static bool s_photo_upload_pending;
 static int64_t s_photo_captured_at_ms;
+
+/* A single pending classroom interaction is small enough for an atomic NVS
+ * blob. It is intentionally separate from telemetry's Flash ring: a button
+ * press must survive reset, but never compete with the 30-day sensor journal. */
+#define INTERACTION_MAGIC 0x494E5431UL /* INT1 */
+#define INTERACTION_VERSION 1U
+#define INTERACTION_NVS_NAMESPACE "interaction"
+#define INTERACTION_NVS_KEY "active_v1"
+
+typedef enum {
+    INTERACTION_NONE = 0,
+    INTERACTION_UPLOAD_PENDING,
+    INTERACTION_AWAITING_RESPONSE,
+    INTERACTION_CANCEL_PENDING,
+    INTERACTION_DELIVERY_ACK_PENDING,
+} interaction_phase_t;
+
+typedef enum {
+    INTERACTION_HELP_REQUEST = 1,
+    INTERACTION_TEST_MESSAGE = 2,
+} interaction_type_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t phase;
+    uint8_t event_type;
+    uint8_t terminal_cancelled;
+    int64_t occurred_at_ms;
+    int64_t server_received_at_ms;
+    int64_t response_at_ms;
+    char event_id[37];
+} interaction_record_t;
+
+static SemaphoreHandle_t s_interaction_lock;
+static interaction_record_t s_interaction;
+static adc_oneshot_unit_handle_t s_interaction_adc;
+static char s_interaction_last_id[37];
+static char s_interaction_last_type[20] = "none";
+static char s_interaction_last_status[32] = "idle";
+static char s_interaction_last_error[64];
+static int64_t s_interaction_last_server_received_at_ms;
+static int64_t s_interaction_last_response_at_ms;
+static int64_t s_interaction_led_until_us;
+static bool s_interaction_led_cancel_pattern;
 
 /* QMA6100P accelerometer, driven by the official Espressif component
  * (espressif/qma6100p) - the same driver model the display_rotation example uses.
@@ -1127,17 +1183,29 @@ static bool collector_uses_https(void)
     return !strncmp(CONFIG_SENSOR_DASH_COLLECTOR_URL, "https://", strlen("https://"));
 }
 
+static bool collector_transport_allowed(void)
+{
+    if (collector_uses_https()) return true;
+#ifdef CONFIG_SENSOR_DASH_ALLOW_INSECURE_LAN
+    return true;
+#else
+    return false;
+#endif
+}
+
 static void collector_tls_config(esp_http_client_config_t *config)
 {
     /* The public Tunnel certificate must be validated.  Never turn this into
      * skip_cert_common_name_check: an API key does not protect against an
      * active network attacker that can impersonate the collector. */
-    config->crt_bundle_attach = esp_crt_bundle_attach;
+    if (collector_uses_https()) {
+        config->crt_bundle_attach = esp_crt_bundle_attach;
+    }
 }
 
 static bool tlm_post_batch(const telemetry_record_t *records, size_t count)
 {
-    if (!collector_uses_https()) return false;
+    if (!collector_transport_allowed()) return false;
     char *body = heap_caps_malloc(12288, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (body == NULL) body = malloc(12288);
     if (body == NULL) return false;
@@ -1187,7 +1255,7 @@ static bool tlm_post_batch(const telemetry_record_t *records, size_t count)
  * the durable queue at display refresh rate would make recovery slower. */
 static bool tlm_post_live_snapshot(const telemetry_snapshot_t *sample)
 {
-    if (!collector_uses_https()) return false;
+    if (!collector_transport_allowed()) return false;
     char body[1536];
     int written = snprintf(body, sizeof(body),
         "{\"device_id\":\"%s\",\"samples\":[{\"boot_id\":\"%016" PRIx64
@@ -1299,10 +1367,417 @@ static void task_url(char *out, size_t out_len, const char *path)
     snprintf(out, out_len, "%.*s%s", (int)base_len, CONFIG_SENSOR_DASH_COLLECTOR_URL, path);
 }
 
+/* ---------------- Board help / test interaction ---------------- */
+
+static const char *interaction_type_name(uint8_t type)
+{
+    return type == INTERACTION_HELP_REQUEST ? "help_request" :
+           type == INTERACTION_TEST_MESSAGE ? "test_message" : "none";
+}
+
+static const char *interaction_phase_name(interaction_phase_t phase)
+{
+    switch (phase) {
+    case INTERACTION_UPLOAD_PENDING: return "pending_upload";
+    case INTERACTION_AWAITING_RESPONSE: return "server_received";
+    case INTERACTION_CANCEL_PENDING: return "cancel_pending";
+    case INTERACTION_DELIVERY_ACK_PENDING: return "viewer_responded";
+    default: return "idle";
+    }
+}
+
+static bool interaction_store_locked(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(INTERACTION_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return false;
+    esp_err_t err;
+    if (s_interaction.phase == INTERACTION_NONE) {
+        err = nvs_erase_key(nvs, INTERACTION_NVS_KEY);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    } else {
+        err = nvs_set_blob(nvs, INTERACTION_NVS_KEY, &s_interaction, sizeof(s_interaction));
+    }
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err == ESP_OK;
+}
+
+static void interaction_set_error_locked(const char *message)
+{
+    snprintf(s_interaction_last_error, sizeof(s_interaction_last_error), "%s", message ? message : "");
+}
+
+static void interaction_set_last_locked(const interaction_record_t *record, const char *status)
+{
+    snprintf(s_interaction_last_id, sizeof(s_interaction_last_id), "%s", record->event_id);
+    snprintf(s_interaction_last_type, sizeof(s_interaction_last_type), "%s",
+             interaction_type_name(record->event_type));
+    snprintf(s_interaction_last_status, sizeof(s_interaction_last_status), "%s", status);
+    s_interaction_last_server_received_at_ms = record->server_received_at_ms;
+    s_interaction_last_response_at_ms = record->response_at_ms;
+}
+
+static void interaction_start_feedback_locked(bool cancelled)
+{
+    s_interaction_led_cancel_pattern = cancelled;
+    s_interaction_led_until_us = esp_timer_get_time() + (cancelled ? 1100000LL : 1000000LL);
+}
+
+static void interaction_finish_locked(bool cancelled)
+{
+    interaction_set_last_locked(&s_interaction, cancelled ? "cancelled" : "viewer_responded");
+    memset(&s_interaction, 0, sizeof(s_interaction));
+    interaction_store_locked();
+    interaction_set_error_locked("");
+    interaction_start_feedback_locked(cancelled);
+}
+
+static void interaction_load(void)
+{
+    nvs_handle_t nvs;
+    size_t length = sizeof(s_interaction);
+    memset(&s_interaction, 0, sizeof(s_interaction));
+    if (nvs_open(INTERACTION_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return;
+    esp_err_t err = nvs_get_blob(nvs, INTERACTION_NVS_KEY, &s_interaction, &length);
+    nvs_close(nvs);
+    if (err != ESP_OK || length != sizeof(s_interaction) ||
+        s_interaction.magic != INTERACTION_MAGIC || s_interaction.version != INTERACTION_VERSION ||
+        s_interaction.phase <= INTERACTION_NONE || s_interaction.phase > INTERACTION_DELIVERY_ACK_PENDING ||
+        strlen(s_interaction.event_id) != 36) {
+        memset(&s_interaction, 0, sizeof(s_interaction));
+        return;
+    }
+    interaction_set_last_locked(&s_interaction, interaction_phase_name(s_interaction.phase));
+    ESP_LOGI(TAG, "restored pending interaction %.8s", s_interaction.event_id);
+}
+
+static void interaction_uuid_v4(char out[37])
+{
+    uint8_t bytes[16];
+    for (size_t i = 0; i < sizeof(bytes); i += sizeof(uint32_t)) {
+        uint32_t value = esp_random();
+        memcpy(bytes + i, &value, sizeof(value));
+    }
+    bytes[6] = (bytes[6] & 0x0FU) | 0x40U;
+    bytes[8] = (bytes[8] & 0x3FU) | 0x80U;
+    snprintf(out, 37,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x%02x%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+             bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+}
+
+static void interaction_create_local(interaction_type_t type)
+{
+    if (!s_interaction_lock) return;
+    xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+    if (s_interaction.phase != INTERACTION_NONE) {
+        interaction_set_error_locked("已有未结束的按键事件");
+        xSemaphoreGive(s_interaction_lock);
+        return;
+    }
+    memset(&s_interaction, 0, sizeof(s_interaction));
+    s_interaction.magic = INTERACTION_MAGIC;
+    s_interaction.version = INTERACTION_VERSION;
+    s_interaction.phase = INTERACTION_UPLOAD_PENDING;
+    s_interaction.event_type = type;
+    s_interaction.occurred_at_ms = tlm_now_ms();
+    interaction_uuid_v4(s_interaction.event_id);
+    if (!interaction_store_locked()) interaction_set_error_locked("事件保存失败");
+    else interaction_set_error_locked("");
+    interaction_set_last_locked(&s_interaction, "pending_upload");
+    ESP_LOGI(TAG, "local %s event %.8s", interaction_type_name(type), s_interaction.event_id);
+    xSemaphoreGive(s_interaction_lock);
+}
+
+static void interaction_cancel_local(void)
+{
+    if (!s_interaction_lock) return;
+    xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+    if (s_interaction.phase == INTERACTION_UPLOAD_PENDING) {
+        interaction_set_last_locked(&s_interaction, "local_cancelled");
+        memset(&s_interaction, 0, sizeof(s_interaction));
+        interaction_store_locked();
+        interaction_set_error_locked("");
+        interaction_start_feedback_locked(true);
+        ESP_LOGI(TAG, "local pending interaction cancelled before upload");
+    } else if (s_interaction.phase == INTERACTION_AWAITING_RESPONSE) {
+        s_interaction.phase = INTERACTION_CANCEL_PENDING;
+        interaction_store_locked();
+        interaction_set_last_locked(&s_interaction, "cancel_pending");
+        interaction_set_error_locked("");
+        ESP_LOGI(TAG, "server-received interaction cancellation requested");
+    }
+    xSemaphoreGive(s_interaction_lock);
+}
+
+static void interaction_led_task(void *arg)
+{
+    while (true) {
+        bool on = false;
+        const int64_t now = esp_timer_get_time();
+        if (s_interaction_lock) xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+        if (now < s_interaction_led_until_us) {
+            if (s_interaction_led_cancel_pattern) {
+                int64_t elapsed = now - (s_interaction_led_until_us - 1100000LL);
+                on = (elapsed / 120000LL) < 6 && ((elapsed / 120000LL) % 2 == 0);
+            } else {
+                on = true; /* viewer response: solid for one second */
+            }
+        } else if (s_interaction.phase == INTERACTION_UPLOAD_PENDING ||
+                   s_interaction.phase == INTERACTION_CANCEL_PENDING) {
+            on = ((now / 125000LL) % 2) == 0; /* 4 Hz awaiting remote persistence */
+        } else if (s_interaction.phase == INTERACTION_AWAITING_RESPONSE) {
+            on = (now % 2000000LL) < 120000LL; /* received: quiet heartbeat */
+        }
+        if (s_interaction_lock) xSemaphoreGive(s_interaction_lock);
+        gpio_set_level(INTERACTION_LED_IO, on ? 0 : 1); /* active-low, open drain */
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
+static int interaction_http_request(const char *url, esp_http_client_method_t method, const char *body,
+                                    char *response_buf, size_t response_len)
+{
+    if (!collector_transport_allowed()) return -1;
+    task_http_response_t response = {.buf = response_buf, .cap = response_len, .len = 0};
+    if (response_buf && response_len) response_buf[0] = '\0';
+    esp_http_client_config_t config = {.url = url, .method = method, .timeout_ms = 5000,
+                                       .event_handler = task_http_event, .user_data = &response};
+    collector_tls_config(&config);
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) return -1;
+    esp_http_client_set_header(client, "X-Api-Key", CONFIG_SENSOR_DASH_COLLECTOR_API_KEY);
+    if (body) {
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, body, strlen(body));
+    }
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    return err == ESP_OK ? status : -1;
+}
+
+static int interaction_post_create(const interaction_record_t *record)
+{
+    char url[192], body[256];
+    task_url(url, sizeof(url), "/api/v1/device-events");
+    snprintf(body, sizeof(body),
+             "{\"device_id\":\"%s\",\"event_id\":\"%s\",\"event_type\":\"%s\",\"occurred_at_ms\":%" PRId64 "}",
+             CONFIG_SENSOR_DASH_DEVICE_ID, record->event_id, interaction_type_name(record->event_type),
+             record->occurred_at_ms);
+    return interaction_http_request(url, HTTP_METHOD_POST, body, NULL, 0);
+}
+
+static int interaction_get_remote(const interaction_record_t *record, char *response, size_t response_len)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "/api/v1/device-events/%s/device?device_id=%s", record->event_id,
+             CONFIG_SENSOR_DASH_DEVICE_ID);
+    char full_url[256];
+    task_url(full_url, sizeof(full_url), url);
+    return interaction_http_request(full_url, HTTP_METHOD_GET, NULL, response, response_len);
+}
+
+static int interaction_post_action(const interaction_record_t *record, const char *action)
+{
+    char path[192], url[256], body[112];
+    snprintf(path, sizeof(path), "/api/v1/device-events/%s/%s", record->event_id, action);
+    task_url(url, sizeof(url), path);
+    snprintf(body, sizeof(body), "{\"device_id\":\"%s\"}", CONFIG_SENSOR_DASH_DEVICE_ID);
+    return interaction_http_request(url, HTTP_METHOD_POST, body, NULL, 0);
+}
+
+static void interaction_task(void *arg)
+{
+    const TickType_t delay = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_TASK_POLL_INTERVAL_MS);
+    while (true) {
+        vTaskDelay(delay);
+        if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) || !s_interaction_lock) continue;
+        interaction_record_t record;
+        xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+        record = s_interaction;
+        xSemaphoreGive(s_interaction_lock);
+        if (record.phase == INTERACTION_NONE) continue;
+
+        if (record.phase == INTERACTION_UPLOAD_PENDING) {
+            int status = interaction_post_create(&record);
+            if (status >= 200 && status < 300) {
+                xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+                if (s_interaction.phase == INTERACTION_UPLOAD_PENDING &&
+                    !strcmp(s_interaction.event_id, record.event_id)) {
+                    s_interaction.phase = INTERACTION_AWAITING_RESPONSE;
+                    s_interaction.server_received_at_ms = tlm_now_ms();
+                    interaction_store_locked();
+                    interaction_set_last_locked(&s_interaction, "server_received");
+                    interaction_set_error_locked("");
+                }
+                xSemaphoreGive(s_interaction_lock);
+            } else {
+                xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+                interaction_set_error_locked(status == -1 ? "等待服务器连接" : "服务器拒绝事件");
+                xSemaphoreGive(s_interaction_lock);
+            }
+            continue;
+        }
+
+        if (record.phase == INTERACTION_AWAITING_RESPONSE) {
+            char response[512];
+            int status = interaction_get_remote(&record, response, sizeof(response));
+            bool cancelled = strstr(response, "\"status\":\"cancelled\"") != NULL;
+            bool responded = strstr(response, "\"status\":\"responded\"") != NULL;
+            if (status >= 200 && status < 300 && (cancelled || responded)) {
+                xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+                if (s_interaction.phase == INTERACTION_AWAITING_RESPONSE &&
+                    !strcmp(s_interaction.event_id, record.event_id)) {
+                    s_interaction.phase = INTERACTION_DELIVERY_ACK_PENDING;
+                    s_interaction.terminal_cancelled = cancelled;
+                    s_interaction.response_at_ms = tlm_now_ms();
+                    interaction_store_locked();
+                    interaction_set_last_locked(&s_interaction, cancelled ? "cancelled" : "viewer_responded");
+                    interaction_set_error_locked("");
+                }
+                xSemaphoreGive(s_interaction_lock);
+            }
+            continue;
+        }
+
+        if (record.phase == INTERACTION_CANCEL_PENDING) {
+            int status = interaction_post_action(&record, "cancel");
+            if (status >= 200 && status < 300) {
+                xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+                if (s_interaction.phase == INTERACTION_CANCEL_PENDING &&
+                    !strcmp(s_interaction.event_id, record.event_id)) {
+                    s_interaction.phase = INTERACTION_DELIVERY_ACK_PENDING;
+                    s_interaction.terminal_cancelled = true;
+                    s_interaction.response_at_ms = tlm_now_ms();
+                    interaction_store_locked();
+                    interaction_set_last_locked(&s_interaction, "cancelled");
+                    interaction_set_error_locked("");
+                }
+                xSemaphoreGive(s_interaction_lock);
+            } else if (status != 409) {
+                xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+                interaction_set_error_locked(status == -1 ? "等待服务器连接" : "服务器拒绝取消");
+                xSemaphoreGive(s_interaction_lock);
+            } else {
+                /* A viewer may have responded in the small race before this cancel.
+                 * Re-enter normal polling so the device can render and acknowledge it. */
+                xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+                if (s_interaction.phase == INTERACTION_CANCEL_PENDING) {
+                    s_interaction.phase = INTERACTION_AWAITING_RESPONSE;
+                    interaction_store_locked();
+                }
+                xSemaphoreGive(s_interaction_lock);
+            }
+            continue;
+        }
+
+        if (record.phase == INTERACTION_DELIVERY_ACK_PENDING) {
+            int status = interaction_post_action(&record, "delivery-ack");
+            if (status >= 200 && status < 300) {
+                xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+                if (s_interaction.phase == INTERACTION_DELIVERY_ACK_PENDING &&
+                    !strcmp(s_interaction.event_id, record.event_id)) {
+                    interaction_finish_locked(s_interaction.terminal_cancelled);
+                }
+                xSemaphoreGive(s_interaction_lock);
+            }
+        }
+    }
+}
+
+typedef enum { BUTTON_NONE = 0, BUTTON_HELP, BUTTON_TEST } interaction_button_t;
+
+static interaction_button_t interaction_read_button(void)
+{
+    if (!s_interaction_adc) return BUTTON_NONE;
+    int raw = 0;
+    if (adc_oneshot_read(s_interaction_adc, INTERACTION_BUTTON_ADC_CHANNEL, &raw) != ESP_OK) return BUTTON_NONE;
+    /* ESP32-S3-EYE BSP resistor-ladder bands: first two function keys only. */
+    if (raw >= 2310 && raw <= 2510) return BUTTON_HELP;
+    if (raw >= 1880 && raw <= 2080) return BUTTON_TEST;
+    return BUTTON_NONE;
+}
+
+static void interaction_button_task(void *arg)
+{
+    interaction_button_t candidate = BUTTON_NONE, stable = BUTTON_NONE, pressed = BUTTON_NONE;
+    int64_t candidate_since = esp_timer_get_time(), press_started = 0;
+    bool long_seen = false;
+    while (true) {
+        const int64_t now = esp_timer_get_time();
+        interaction_button_t raw = interaction_read_button();
+        if (raw != candidate) {
+            candidate = raw;
+            candidate_since = now;
+        }
+        if (candidate == stable || now - candidate_since < INTERACTION_BUTTON_DEBOUNCE_US) {
+            if (pressed != BUTTON_NONE && stable == pressed && !long_seen &&
+                now - press_started >= INTERACTION_BUTTON_LONG_US) {
+                interaction_cancel_local();
+                long_seen = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(INTERACTION_BUTTON_POLL_MS));
+            continue;
+        }
+        interaction_button_t previous = stable;
+        stable = candidate;
+        if (previous != BUTTON_NONE && stable == BUTTON_NONE) {
+            if (!long_seen) {
+                interaction_create_local(previous == BUTTON_HELP ? INTERACTION_HELP_REQUEST : INTERACTION_TEST_MESSAGE);
+            }
+            pressed = BUTTON_NONE;
+        } else if (stable != BUTTON_NONE) {
+            pressed = stable;
+            press_started = now;
+            long_seen = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(INTERACTION_BUTTON_POLL_MS));
+    }
+}
+
+static void interaction_init(void)
+{
+    s_interaction_lock = xSemaphoreCreateMutex();
+    if (!s_interaction_lock) {
+        ESP_LOGE(TAG, "interaction lock allocation failed");
+        return;
+    }
+    xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+    interaction_load();
+    xSemaphoreGive(s_interaction_lock);
+
+    const gpio_config_t led_cfg = {
+        .pin_bit_mask = 1ULL << INTERACTION_LED_IO,
+        .mode = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&led_cfg));
+    ESP_ERROR_CHECK(gpio_set_level(INTERACTION_LED_IO, 1));
+
+    adc_oneshot_unit_init_cfg_t unit_cfg = {.unit_id = ADC_UNIT_1};
+    if (adc_oneshot_new_unit(&unit_cfg, &s_interaction_adc) != ESP_OK) {
+        ESP_LOGW(TAG, "interaction keypad ADC unavailable");
+        s_interaction_adc = NULL;
+    } else {
+        adc_oneshot_chan_cfg_t channel_cfg = {
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+            .atten = ADC_ATTEN_DB_12,
+        };
+        if (adc_oneshot_config_channel(s_interaction_adc, INTERACTION_BUTTON_ADC_CHANNEL, &channel_cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "interaction keypad channel setup failed");
+            adc_oneshot_del_unit(s_interaction_adc);
+            s_interaction_adc = NULL;
+        }
+    }
+}
+
 static bool task_http_request(const char *url, esp_http_client_method_t method, const char *body,
                               char *response_buf, size_t response_len)
 {
-    if (!collector_uses_https()) return false;
+    if (!collector_transport_allowed()) return false;
     task_http_response_t response = {.buf = response_buf, .cap = response_len, .len = 0};
     if (response_buf && response_len) response_buf[0] = '\0';
     esp_http_client_config_t config = {.url = url, .method = method, .timeout_ms = 5000,
@@ -1373,7 +1848,7 @@ static bool task_post_failure(const char *request_id, const char *error)
 
 static bool task_post_photo(const char *request_id, int64_t captured_at_ms)
 {
-    if (!collector_uses_https()) return false;
+    if (!collector_transport_allowed()) return false;
     if (s_photo_bmp == NULL) return false;
     char url[192], captured_at[32];
     task_url(url, sizeof(url), "/api/v1/capture-tasks/");
@@ -1666,6 +2141,7 @@ void app_main(void)
     ESP_ERROR_CHECK(err);
     s_boot_id = ((uint64_t)esp_random() << 32) | esp_random();
     tlm_queue_init();
+    interaction_init();
 
     /* --- on-chip temperature sensor --- */
     temperature_sensor_handle_t temp_sensor = NULL;
@@ -1733,6 +2209,15 @@ void app_main(void)
     if (xTaskCreate(capture_task_poll_task, "capture_task_poll", 8192, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "capture_task_poll task creation failed - on-demand capture unavailable");
     }
+    if (xTaskCreate(interaction_led_task, "interaction_led", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "interaction LED task creation failed");
+    }
+    if (xTaskCreate(interaction_task, "interaction_sync", 6144, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "interaction sync task creation failed");
+    }
+    if (s_interaction_adc && xTaskCreate(interaction_button_task, "interaction_button", 4096, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "interaction button task creation failed");
+    }
 
     const TickType_t interval = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_INTERVAL_MS);
 
@@ -1794,6 +2279,36 @@ void app_main(void)
             }
         }
 
+        char interaction_id[37], interaction_type[20], interaction_status[32], interaction_error[64];
+        int64_t interaction_occurred_at_ms, interaction_server_received_at_ms, interaction_response_at_ms;
+        if (s_interaction_lock) {
+            xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
+            const interaction_record_t interaction = s_interaction;
+            if (interaction.phase != INTERACTION_NONE) {
+                snprintf(interaction_id, sizeof(interaction_id), "%s", interaction.event_id);
+                snprintf(interaction_type, sizeof(interaction_type), "%s", interaction_type_name(interaction.event_type));
+                snprintf(interaction_status, sizeof(interaction_status), "%s", interaction_phase_name(interaction.phase));
+                interaction_occurred_at_ms = interaction.occurred_at_ms;
+                interaction_server_received_at_ms = interaction.server_received_at_ms;
+                interaction_response_at_ms = interaction.response_at_ms;
+            } else {
+                snprintf(interaction_id, sizeof(interaction_id), "%s", s_interaction_last_id);
+                snprintf(interaction_type, sizeof(interaction_type), "%s", s_interaction_last_type);
+                snprintf(interaction_status, sizeof(interaction_status), "%s", s_interaction_last_status);
+                interaction_occurred_at_ms = 0;
+                interaction_server_received_at_ms = s_interaction_last_server_received_at_ms;
+                interaction_response_at_ms = s_interaction_last_response_at_ms;
+            }
+            snprintf(interaction_error, sizeof(interaction_error), "%s", s_interaction_last_error);
+            xSemaphoreGive(s_interaction_lock);
+        } else {
+            interaction_id[0] = '\0';
+            snprintf(interaction_type, sizeof(interaction_type), "none");
+            snprintf(interaction_status, sizeof(interaction_status), "unavailable");
+            snprintf(interaction_error, sizeof(interaction_error), "interaction unavailable");
+            interaction_occurred_at_ms = interaction_server_received_at_ms = interaction_response_at_ms = 0;
+        }
+
         xSemaphoreTake(s_json_lock, portMAX_DELAY);
         int shot_idx = s_cam_ctx.ready;
         snprintf(s_json, sizeof(s_json),
@@ -1805,7 +2320,11 @@ void app_main(void)
                  "\"lcd_frames\":%lu,\"lcd_fps\":%.1f,\"lcd_err\":%lu,"
                  "\"telemetry_queue\":%u,\"telemetry_dropped\":%lu,"
                  "\"upload_ok\":%s,\"last_upload_ms\":%lld,"
-                 "\"live_upload_ok\":%s,\"last_live_upload_ms\":%lld}",
+                 "\"live_upload_ok\":%s,\"last_live_upload_ms\":%lld,"
+                 "\"interaction_event_id\":\"%s\",\"interaction_type\":\"%s\","
+                 "\"interaction_status\":\"%s\",\"interaction_occurred_at_ms\":%lld,"
+                 "\"interaction_server_received_at_ms\":%lld,\"interaction_response_at_ms\":%lld,"
+                 "\"interaction_error\":\"%s\"}",
                  temp_c,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),   /* internal SRAM only */
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -1824,7 +2343,11 @@ void app_main(void)
                  s_upload_ok ? "true" : "false",
                  (long long)s_last_upload_ms,
                  s_live_upload_ok ? "true" : "false",
-                 (long long)s_last_live_upload_ms);
+                 (long long)s_last_live_upload_ms,
+                 interaction_id, interaction_type, interaction_status,
+                 (long long)interaction_occurred_at_ms,
+                 (long long)interaction_server_received_at_ms,
+                 (long long)interaction_response_at_ms, interaction_error);
         xSemaphoreGive(s_json_lock);
 
         telemetry_snapshot_t sample = {

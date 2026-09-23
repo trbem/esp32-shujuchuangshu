@@ -80,6 +80,7 @@
       <span class="badge" id="rateText">-- Hz</span>
       <span class="badge" id="uptimeText">--</span>
       <span class="badge" id="uploadText">遥测等待中</span>
+      <span class="badge" id="interactionText">按键事件：空闲</span>
       <span class="chip-imu" id="imuChip">IMU 检测中…</span>
     </div>
   </header>
@@ -348,6 +349,12 @@ function push(d){
     upload.textContent = '遥测暂未上传 · 待 ' + d.telemetry_queue;
     upload.style.color = 'var(--yellow)';
   }
+  const interaction = document.getElementById('interactionText');
+  const interactionLabels = {idle:'空闲',pending_upload:'待上传',server_received:'服务器已接收',
+    cancel_pending:'取消待上传',viewer_responded:'查看者已回应',cancelled:'已取消',local_cancelled:'本地已取消'};
+  interaction.textContent = '按键事件：' + (interactionLabels[d.interaction_status] || d.interaction_status || '空闲');
+  interaction.style.color = d.interaction_status === 'pending_upload' ? 'var(--yellow)' :
+    (d.interaction_status === 'server_received' || d.interaction_status === 'viewer_responded' ? 'var(--green)' : '');
   if(d.jpeg != null) document.getElementById('camMeta').textContent =
     'RGB565 ' + (d.jpeg/1024).toFixed(1) + ' KB / 帧 · ' + (d.fps != null ? d.fps.toFixed(0) + ' fps' : '--') +
     ' · 推屏 ' + (d.lcd_fps != null ? d.lcd_fps.toFixed(0) + ' fps' : '--') +

@@ -88,6 +88,22 @@ class PeriodicIngestionControl(BaseModel):
     paused: bool
 
 
+class DeviceEventCreate(BaseModel):
+    """A locally-confirmed button action uploaded by one ESP32 device."""
+    device_id: str = Field(min_length=1, max_length=64)
+    event_id: str = Field(min_length=36, max_length=36)
+    event_type: Literal["help_request", "test_message"]
+    occurred_at_ms: int = Field(ge=0)
+
+
+class DeviceEventDeviceRef(BaseModel):
+    device_id: str = Field(min_length=1, max_length=64)
+
+
+class DeviceEventResponse(BaseModel):
+    message: str = Field(default="", max_length=280)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS telemetry (
   id INTEGER PRIMARY KEY,
@@ -134,6 +150,22 @@ CREATE TABLE IF NOT EXISTS photos (
   storage_name TEXT NOT NULL UNIQUE
 );
 CREATE INDEX IF NOT EXISTS photos_device_time_idx ON photos(device_id, received_at_ms DESC);
+CREATE TABLE IF NOT EXISTS device_events (
+  id INTEGER PRIMARY KEY,
+  event_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  occurred_at_ms INTEGER NOT NULL,
+  received_at_ms INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  viewer_message TEXT,
+  viewer_responded_at_ms INTEGER,
+  cancelled_at_ms INTEGER,
+  cancelled_by TEXT,
+  device_acknowledged_at_ms INTEGER,
+  UNIQUE(device_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS device_events_device_time_idx ON device_events(device_id, received_at_ms DESC);
 """
 
 # Columns added after the first release.  CREATE TABLE IF NOT EXISTS leaves an
@@ -213,6 +245,12 @@ class Store:
                     "DELETE FROM telemetry WHERE "
                     "(captured_at_ms > 0 AND captured_at_ms < ?) OR "
                     "(captured_at_ms = 0 AND received_at_ms < ?)",
+                    (cutoff, cutoff),
+                )
+                conn.execute(
+                    "DELETE FROM device_events WHERE "
+                    "(occurred_at_ms > 0 AND occurred_at_ms < ?) OR "
+                    "(occurred_at_ms = 0 AND received_at_ms < ?)",
                     (cutoff, cutoff),
                 )
                 expired = conn.execute(
@@ -453,6 +491,92 @@ class Store:
             path = self.photo_dir / row["storage_name"]
             return path if path.is_file() else None
 
+    def create_device_event(self, event: DeviceEventCreate) -> dict:
+        """Persist a button event before telling the board that it reached us.
+
+        The device owns event_id generation. Returning an existing row for the
+        same (device, event_id) makes retries after a lost HTTP response safe.
+        """
+        now = int(time.time() * 1000)
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO device_events("
+                "event_id,device_id,event_type,occurred_at_ms,received_at_ms,status) "
+                "VALUES(?,?,?,?,?, 'received')",
+                (event.event_id, event.device_id, event.event_type, event.occurred_at_ms, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM device_events WHERE device_id=? AND event_id=?",
+                (event.device_id, event.event_id),
+            ).fetchone()
+            return dict(row)
+
+    @staticmethod
+    def _event_for_device(conn: sqlite3.Connection, event_id: str, device_id: str) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT * FROM device_events WHERE event_id=? AND device_id=?", (event_id, device_id)
+        ).fetchone()
+        if not row:
+            raise KeyError("事件不存在或不属于该设备")
+        return row
+
+    def get_device_event(self, event_id: str, device_id: str) -> dict:
+        with self.connect() as conn:
+            return dict(self._event_for_device(conn, event_id, device_id))
+
+    def cancel_device_event(self, event_id: str, device_id: str, cancelled_by: str) -> dict:
+        with self.connect() as conn:
+            row = self._event_for_device(conn, event_id, device_id)
+            if row["status"] == "cancelled":
+                return dict(row)
+            if row["status"] == "responded":
+                raise ValueError("查看者已经回应，不能取消")
+            now = int(time.time() * 1000)
+            conn.execute(
+                "UPDATE device_events SET status='cancelled', cancelled_at_ms=?, cancelled_by=? "
+                "WHERE id=?", (now, cancelled_by, row["id"])
+            )
+            return dict(conn.execute("SELECT * FROM device_events WHERE id=?", (row["id"],)).fetchone())
+
+    def respond_device_event(self, event_id: str, message: str) -> dict:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM device_events WHERE event_id=?", (event_id,)).fetchone()
+            if not row:
+                raise KeyError("事件不存在")
+            if row["status"] == "responded":
+                return dict(row)
+            if row["status"] == "cancelled":
+                raise ValueError("事件已取消")
+            now = int(time.time() * 1000)
+            conn.execute(
+                "UPDATE device_events SET status='responded', viewer_message=?, viewer_responded_at_ms=? WHERE id=?",
+                (message, now, row["id"]),
+            )
+            return dict(conn.execute("SELECT * FROM device_events WHERE id=?", (row["id"],)).fetchone())
+
+    def acknowledge_device_event_delivery(self, event_id: str, device_id: str) -> dict:
+        with self.connect() as conn:
+            row = self._event_for_device(conn, event_id, device_id)
+            if row["status"] not in ("responded", "cancelled"):
+                raise ValueError("查看者尚未回应或取消")
+            if row["device_acknowledged_at_ms"] is None:
+                conn.execute(
+                    "UPDATE device_events SET device_acknowledged_at_ms=? WHERE id=?",
+                    (int(time.time() * 1000), row["id"]),
+                )
+            return dict(conn.execute("SELECT * FROM device_events WHERE id=?", (row["id"],)).fetchone())
+
+    def list_device_events(self, device_id: str | None = None) -> list[dict]:
+        with self.connect() as conn:
+            if device_id:
+                rows = conn.execute(
+                    "SELECT * FROM device_events WHERE device_id=? ORDER BY received_at_ms DESC LIMIT 100",
+                    (device_id,),
+                )
+            else:
+                rows = conn.execute("SELECT * FROM device_events ORDER BY received_at_ms DESC LIMIT 100")
+            return [dict(row) for row in rows]
+
     def query(self, start_ms: int | None, end_ms: int | None, device_id: str | None, limit: int):
         where, values = [], []
         if start_ms is not None:
@@ -493,6 +617,13 @@ def create_app(database: Path | None = None, api_key: str | None = None,
             return True
         if method == "GET" and path.startswith("/api/v1/devices/") and path.endswith("/tasks/next"):
             return True
+        if method == "POST" and path == "/api/v1/device-events":
+            return True
+        if method == "GET" and path.startswith("/api/v1/device-events/") and path.endswith("/device"):
+            return True
+        if method == "POST" and path.startswith("/api/v1/device-events/") and \
+                path.rsplit("/", 1)[-1] in {"cancel", "delivery-ack"}:
+            return True
         return (method == "POST" and path.startswith("/api/v1/capture-tasks/") and
                 path.rsplit("/", 1)[-1] in {"ack", "result", "photo", "fail"})
 
@@ -529,6 +660,63 @@ def create_app(database: Path | None = None, api_key: str | None = None,
     @app.get("/api/v1/devices")
     def get_devices():
         return {"devices": store.list_devices()}
+
+    @app.post("/api/v1/device-events", status_code=201)
+    def create_device_event(event: DeviceEventCreate, _: None = Depends(require_api_key)):
+        store.cleanup()
+        return store.create_device_event(event)
+
+    @app.get("/api/v1/device-events")
+    def get_device_events(device_id: str | None = None):
+        store.cleanup()
+        return {"events": store.list_device_events(device_id)}
+
+    @app.get("/api/v1/device-events/{event_id}/device")
+    def get_device_event(event_id: str, device_id: str, _: None = Depends(require_api_key)):
+        try:
+            return store.get_device_event(event_id, device_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/device-events/{event_id}/cancel")
+    def device_cancel_event(event_id: str, event: DeviceEventDeviceRef, _: None = Depends(require_api_key)):
+        try:
+            return store.cancel_device_event(event_id, event.device_id, "device")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/device-events/{event_id}/delivery-ack")
+    def acknowledge_event_delivery(event_id: str, event: DeviceEventDeviceRef, _: None = Depends(require_api_key)):
+        try:
+            return store.acknowledge_device_event_delivery(event_id, event.device_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.put("/api/v1/device-events/{event_id}/respond")
+    def respond_event(event_id: str, response: DeviceEventResponse):
+        try:
+            return store.respond_device_event(event_id, response.message.strip())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.put("/api/v1/device-events/{event_id}/cancel")
+    def viewer_cancel_event(event_id: str):
+        try:
+            with store.connect() as conn:
+                row = conn.execute("SELECT device_id FROM device_events WHERE event_id=?", (event_id,)).fetchone()
+            if not row:
+                raise KeyError("事件不存在")
+            return store.cancel_device_event(event_id, row["device_id"], "viewer")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/capture-tasks", status_code=201)
     def create_capture_task(request: CaptureTaskCreate):

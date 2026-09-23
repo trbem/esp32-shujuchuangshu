@@ -227,5 +227,47 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.query("SELECT count(*) FROM photos")[0][0], 0)
         self.assertEqual(self.query("SELECT photo_id FROM capture_tasks WHERE request_id='%s'" % task["request_id"])[0][0], None)
 
+    def test_device_events_are_authenticated_idempotent_and_trace_viewer_feedback(self):
+        headers = {"X-Api-Key": "test-key"}
+        event = {
+            "device_id": "s3eye-001", "event_id": "9e2c1fa0-6648-4b5a-93df-0d343de0c19c",
+            "event_type": "help_request", "occurred_at_ms": 1700000000999,
+        }
+        self.assertEqual(self.client.post("/api/v1/device-events", json=event).status_code, 401)
+        created = self.client.post("/api/v1/device-events", json=event, headers=headers)
+        self.assertEqual((created.status_code, created.json()["status"]), (201, "received"))
+        replayed = self.client.post("/api/v1/device-events", json=event, headers=headers)
+        self.assertEqual(replayed.json()["id"], created.json()["id"])
+        self.assertEqual(self.query("SELECT count(*) FROM device_events")[0][0], 1)
+
+        event_id = event["event_id"]
+        device = self.client.get(f"/api/v1/device-events/{event_id}/device?device_id=s3eye-001", headers=headers)
+        self.assertEqual(device.json()["status"], "received")
+        replied = self.client.put(f"/api/v1/device-events/{event_id}/respond", json={"message": "已收到，请继续"})
+        self.assertEqual((replied.status_code, replied.json()["status"], replied.json()["viewer_message"]),
+                         (200, "responded", "已收到，请继续"))
+        delivered = self.client.post(f"/api/v1/device-events/{event_id}/delivery-ack",
+                                     headers=headers, json={"device_id": "s3eye-001"})
+        self.assertIsNotNone(delivered.json()["device_acknowledged_at_ms"])
+        self.assertEqual(self.client.post(f"/api/v1/device-events/{event_id}/cancel", headers=headers,
+                                          json={"device_id": "s3eye-001"}).status_code, 409)
+
+        cancelled = dict(event, event_id="7f19842b-d743-4bfe-b5e9-b4a755be4687", event_type="test_message")
+        self.client.post("/api/v1/device-events", json=cancelled, headers=headers)
+        remote_cancel = self.client.put(f"/api/v1/device-events/{cancelled['event_id']}/cancel")
+        self.assertEqual((remote_cancel.status_code, remote_cancel.json()["status"], remote_cancel.json()["cancelled_by"]),
+                         (200, "cancelled", "viewer"))
+        self.assertIsNotNone(self.client.post(f"/api/v1/device-events/{cancelled['event_id']}/delivery-ack",
+                                               headers=headers, json={"device_id": "s3eye-001"}).json()["device_acknowledged_at_ms"])
+
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE device_events SET occurred_at_ms=0, received_at_ms=0")
+            conn.commit()
+        finally:
+            conn.close()
+        self.client.app.state.store.cleanup(force=True)
+        self.assertEqual(self.query("SELECT count(*) FROM device_events")[0][0], 0)
+
 
 if __name__ == '__main__': unittest.main()

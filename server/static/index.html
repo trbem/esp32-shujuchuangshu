@@ -4,7 +4,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 遥测、按需采集与远程拍照</title>
 <style>
-body{margin:0;background:#101723;color:#eaf0fb;font:15px system-ui,sans-serif}main{max-width:1120px;margin:auto;padding:24px}h1,h2{margin:0 0 16px}.toolbar,.cards,.gallery{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.toolbar{margin-bottom:16px}input,select,button,a{padding:9px;border-radius:7px;border:1px solid #3a4b66;background:#192536;color:inherit}button,a{cursor:pointer;text-decoration:none}.primary{background:#1769d2}.photo{background:#087c91}.warn{background:#754d00}.cards{margin-bottom:16px}.card,section{background:#192536;padding:13px;border-radius:8px}.card{min-width:150px}.label,.hint{color:#9bb0ce}.label{font-size:12px}.hint{font-size:13px;line-height:1.55}.value{font-size:21px;margin-top:4px}section{margin:14px 0}canvas{width:100%;height:220px;background:#111b2a;border-radius:5px}#status,#liveStatus{color:#9bb0ce}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #30415b;padding:8px;text-align:left}.pill{border-radius:12px;padding:3px 8px;background:#30415b;white-space:nowrap}.completed{background:#176b3a}.failed,.timeout{background:#80343b}.received{background:#315f9f}.submitted{background:#8b6518}.gallery{align-items:stretch}.photo-card{width:220px;border:1px solid #30415b;border-radius:8px;overflow:hidden;background:#111b2a}.photo-card img{width:220px;height:220px;display:block;object-fit:cover;background:#0a101a}.photo-meta{padding:10px;font-size:13px;line-height:1.55}.empty{color:#9bb0ce;padding:8px}.live-dot{color:#65dc98;font-size:18px;vertical-align:-1px}
+body{margin:0;background:#101723;color:#eaf0fb;font:15px system-ui,sans-serif}main{max-width:1120px;margin:auto;padding:24px}h1,h2{margin:0 0 16px}.toolbar,.cards,.gallery{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.toolbar{margin-bottom:16px}input,select,button,a{padding:9px;border-radius:7px;border:1px solid #3a4b66;background:#192536;color:inherit}button,a{cursor:pointer;text-decoration:none}.primary{background:#1769d2}.photo{background:#087c91}.warn{background:#754d00}.cards{margin-bottom:16px}.card,section{background:#192536;padding:13px;border-radius:8px}.card{min-width:150px}.label,.hint{color:#9bb0ce}.label{font-size:12px}.hint{font-size:13px;line-height:1.55}.value{font-size:21px;margin-top:4px}section{margin:14px 0}canvas{width:100%;height:220px;background:#111b2a;border-radius:5px}#status,#liveStatus{color:#9bb0ce}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #30415b;padding:8px;text-align:left;vertical-align:top}.pill{border-radius:12px;padding:3px 8px;background:#30415b;white-space:nowrap}.completed{background:#176b3a}.failed,.timeout{background:#80343b}.received{background:#315f9f}.submitted{background:#8b6518}.event-received{background:#315f9f}.event-responded{background:#176b3a}.event-cancelled{background:#754d00}.event-action{display:flex;gap:6px;flex-wrap:wrap}.event-action input{min-width:170px;padding:6px}.gallery{align-items:stretch}.photo-card{width:220px;border:1px solid #30415b;border-radius:8px;overflow:hidden;background:#111b2a}.photo-card img{width:220px;height:220px;display:block;object-fit:cover;background:#0a101a}.photo-meta{padding:10px;font-size:13px;line-height:1.55}.empty{color:#9bb0ce;padding:8px}.live-dot{color:#65dc98;font-size:18px;vertical-align:-1px}
 </style>
 <main>
   <h1>ESP32 遥测、按需采集与远程拍照</h1>
@@ -29,6 +29,11 @@ body{margin:0;background:#101723;color:#eaf0fb;font:15px system-ui,sans-serif}ma
     <table><thead><tr><th>请求 ID</th><th>类型</th><th>设备</th><th>状态</th><th>创建 / 接收 / 完成</th><th>关联结果</th><th>说明</th></tr></thead><tbody id="tasks"></tbody></table>
   </section>
   <section>
+    <h2>板载求助与测试事件</h2>
+    <p class="hint">开发板按键产生的记录只会在服务器事务保存后显示“服务器已接收”。在此处填写回应或取消后，只有开发板轮询并回执，才会显示“开发板已确认”。</p>
+    <table><thead><tr><th>事件 ID / 类型</th><th>设备</th><th>板端发生 / 服务器接收</th><th>状态</th><th>回应</th><th>开发板确认</th><th>操作</th></tr></thead><tbody id="events"></tbody></table>
+  </section>
+  <section>
     <h2>照片画廊</h2>
     <p class="hint">仅显示远程拍照任务上传的单张图片；服务器保存 7 天后自动清理。页面刷新不会向设备请求图片。</p>
     <div id="gallery" class="gallery"><div class="empty">尚无已上传照片</div></div>
@@ -39,6 +44,7 @@ const $=id=>document.getElementById(id),now=new Date(),ago=new Date(now-86400000
 $('start').value=local(ago);$('end').value=local(now);
 const fmt=n=>n?new Date(n).toLocaleString():'—';
 const ms=id=>{const v=$(id).value;return v?new Date(v).getTime():''};
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let liveSamples=[];
 
 function draw(id,series){
@@ -74,11 +80,16 @@ async function devices(){
   $('device').innerHTML=ds.map(d=>`<option value="${d.device_id}">${d.device_id}</option>`).join('');$('device').value=old||ds[0].device_id;
 }
 async function tasks(){const data=await fetch('/api/v1/capture-tasks').then(r=>r.json());$('tasks').innerHTML=data.tasks.map(t=>{const result=t.photo_id?`<a href="/api/v1/photos/${t.photo_id}/image" target="_blank">照片 #${t.photo_id}</a>`:t.telemetry_id?`#${t.telemetry_id}`:'—';return `<tr><td title="${t.request_id}">${t.request_id.slice(0,8)}…</td><td>${t.task_type==='capture_photo'?'远程拍照':'传感器快照'}</td><td>${t.device_id}</td><td><span class="pill ${t.status}">${t.status}</span></td><td>${fmt(t.created_at_ms)} / ${fmt(t.received_at_ms)} / ${fmt(t.completed_at_ms)}</td><td>${result}</td><td>${t.error||t.sensor_sources}</td></tr>`}).join('')||'<tr><td colspan="7">尚未创建任务</td></tr>'}
+const eventType=t=>t==='help_request'?'教学求助':'测试消息';
+const eventStatus=e=>e.status==='received'?'服务器已接收':e.status==='responded'?'查看者已回应':'已取消';
+async function respondEvent(id){const input=document.querySelector(`[data-event-reply="${id}"]`),r=await fetch('/api/v1/device-events/'+encodeURIComponent(id)+'/respond',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:input?.value||''})});if(!r.ok)alert('回应失败：'+(await r.text()));events()}
+async function cancelEvent(id){const r=await fetch('/api/v1/device-events/'+encodeURIComponent(id)+'/cancel',{method:'PUT'});if(!r.ok)alert('取消失败：'+(await r.text()));events()}
+async function events(){const device=$('device').value,q=device?'?device_id='+encodeURIComponent(device):'';try{const data=await fetch('/api/v1/device-events'+q).then(r=>r.json());$('events').innerHTML=data.events.map(e=>{const action=e.status==='received'?`<div class="event-action"><input data-event-reply="${e.event_id}" maxlength="280" placeholder="回应（可选）"><button data-respond="${e.event_id}">确认回应</button><button class="warn" data-cancel="${e.event_id}">取消</button></div>`:'—';const ack=e.device_acknowledged_at_ms?fmt(e.device_acknowledged_at_ms):'等待开发板回执';return `<tr><td title="${esc(e.event_id)}">${esc(e.event_id.slice(0,8))}…<br>${eventType(e.event_type)}</td><td>${esc(e.device_id)}</td><td>${fmt(e.occurred_at_ms)}<br>${fmt(e.received_at_ms)}</td><td><span class="pill event-${esc(e.status)}">${eventStatus(e)}</span>${e.cancelled_by?'<br>取消：'+esc(e.cancelled_by):''}</td><td>${esc(e.viewer_message||'—')}<br>${fmt(e.viewer_responded_at_ms)}</td><td>${ack}</td><td>${action}</td></tr>`}).join('')||'<tr><td colspan="7">该设备尚无板载事件</td></tr>';document.querySelectorAll('[data-respond]').forEach(b=>b.onclick=()=>respondEvent(b.dataset.respond));document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=()=>cancelEvent(b.dataset.cancel))}catch(error){$('events').innerHTML='<tr><td colspan="7">事件读取失败：'+esc(error.message)+'</td></tr>'}}
 async function photos(){const device=$('device').value,q=device?'?device_id='+encodeURIComponent(device):'',data=await fetch('/api/v1/photos'+q).then(r=>r.json());$('gallery').innerHTML=data.photos.map(p=>`<article class="photo-card"><a href="/api/v1/photos/${p.id}/image" target="_blank"><img src="/api/v1/photos/${p.id}/image" alt="${p.request_id} 的远程照片"></a><div class="photo-meta"><b>${p.device_id}</b><br>拍摄：${fmt(p.captured_at_ms)}<br>大小：${p.byte_size.toLocaleString()} B<br><a href="/api/v1/capture-tasks/${p.request_id}" target="_blank">请求 ${p.request_id.slice(0,8)}…</a></div></article>`).join('')||'<div class="empty">该设备尚无已上传照片</div>'}
 async function state(){const s=await fetch('/api/v1/control/periodic-ingestion').then(r=>r.json());$('toggle').textContent=s.paused?'恢复周期遥测入库':'暂停周期遥测入库';$('toggle').dataset.paused=s.paused}
 async function createTask(taskType){const r=await fetch('/api/v1/capture-tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_id:$('device').value,task_type:taskType})}),t=await r.json();$('taskStatus').textContent=`已提交 ${taskType==='capture_photo'?'拍照':'快照'}任务 ${t.request_id}`;tasks()}
 $('capture').onclick=()=>createTask('capture_full_snapshot');$('photo').onclick=()=>createTask('capture_photo');$('toggle').onclick=async()=>{const paused=$('toggle').dataset.paused!=='true';await fetch('/api/v1/control/periodic-ingestion',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused})});state()};$('refresh').onclick=load;
-$('device').onchange=()=>{liveSamples=[];live();load();photos()};
-devices().then(()=>Promise.all([live(),load(),tasks(),state(),photos()]));
-setInterval(live,1000);setInterval(()=>{tasks();photos()},2000);
+$('device').onchange=()=>{liveSamples=[];live();load();photos();events()};
+devices().then(()=>Promise.all([live(),load(),tasks(),state(),photos(),events()]));
+setInterval(live,1000);setInterval(()=>{tasks();photos();events()},2000);
 </script>

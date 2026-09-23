@@ -870,8 +870,11 @@ static bool wifi_connect_and_wait(const wifi_credentials_t *credentials, TickTyp
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "Wi-Fi started");
-        esp_wifi_connect();
+        /* wifi_connect_and_wait() owns both the station configuration and
+         * connection. Starting a connection here races its set_config call
+         * during boot and makes ESP-IDF reject that call with
+         * ESP_ERR_WIFI_STATE. */
+        ESP_LOGI(TAG, "Wi-Fi started; connection will be initiated by controller");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         if (++s_wifi_failures < 3) {

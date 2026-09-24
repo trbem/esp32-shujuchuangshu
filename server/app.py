@@ -617,6 +617,8 @@ def create_app(database: Path | None = None, api_key: str | None = None,
             return True
         if method == "GET" and path.startswith("/api/v1/devices/") and path.endswith("/tasks/next"):
             return True
+        if method == "POST" and path.startswith("/api/v1/devices/") and path.endswith("/capture-photo"):
+            return True
         if method == "POST" and path == "/api/v1/device-events":
             return True
         if method == "GET" and path.startswith("/api/v1/device-events/") and path.endswith("/device"):
@@ -736,6 +738,15 @@ def create_app(database: Path | None = None, api_key: str | None = None,
     @app.get("/api/v1/devices/{device_id}/tasks/next")
     def get_next_task(device_id: str, _: None = Depends(require_api_key)):
         return {"task": store.next_task(device_id)}
+
+    @app.post("/api/v1/devices/{device_id}/capture-photo", status_code=201)
+    def create_device_capture_photo(device_id: str, _: None = Depends(require_api_key)):
+        """Allow the device-local dashboard to request one authenticated photo.
+
+        It deliberately creates only a photo task; browser operators keep using
+        the dashboard endpoint for full sensor snapshots and task management.
+        """
+        return store.create_task(device_id, "capture_photo")
 
     @app.post("/api/v1/capture-tasks/{request_id}/ack")
     def acknowledge_capture_task(request_id: str, ack: TaskAck, _: None = Depends(require_api_key)):

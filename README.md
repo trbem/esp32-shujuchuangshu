@@ -14,7 +14,11 @@ ESP32-S3-EYE 开发板自己跑一个 HTTP 服务，浏览器直接打开板子 
 | `GET /` | 面板页面（`main/dashboard.html`，用 `EMBED_TXTFILES` 嵌进固件） |
 | `GET /data` | 一路 JSON 采样，页面每 500 ms 轮询一次 |
 | `GET /shot` | 取景帧的 240×240 BMP 快照（`image/bmp`，172854 字节） |
+| `POST /api/actions/upload-now` | 从板载面板采集当前指标、写入 Flash 队列并立即触发一次 FIFO 上传 |
+| `POST /api/actions/remote-photo` | 从板载面板创建一条受设备 API 密钥保护的单次远程拍照任务 |
 | mDNS | `http://s3eye.local/`（Windows 默认不解析 `.local`，手机 / Linux 可用） |
+
+![传感器面板截图；新增操作区域位于指标卡片下方](docs/assets/sensor-panel-actions.png)
 
 `/data` 返回示例：
 
@@ -242,6 +246,17 @@ New-NetFirewallRule -DisplayName "ESP32 Telemetry 8080" -Direction Inbound -Acti
 上传中的网络故障会重试同一张缓冲照片。设备重启后，服务器仍会下发处于 `received` 的任务，板端会重新拍摄
 并补传；服务端以 `request_id` 去重，因此图库只保留一张照片。现有板载 `/shot` 与 LCD 取景仍可用，但它们
 仅服务本地预览，不会将画面上传到服务器。
+
+### 从传感器面板操作上传与拍照
+
+打开开发板自己的 `http://<板子IP>/`，在指标卡片下方可以直接使用两个按钮：
+
+| 按钮 | 动作与完成条件 |
+|---|---|
+| **立即上传数据** | 复制当前传感器快照，先写入 Flash 可靠队列，再立刻唤醒 FIFO 上传任务。按钮只表示“已入队”；顶部“遥测上传正常”及服务端记录才表示实际送达。 |
+| **远程拍照并上传** | 开发板携带 API 密钥向服务器创建一条 `capture_photo` 任务。原有任务轮询收到后 ACK、等待新的一帧、上传一张 BMP；面板依次显示已提交、拍照中、上传待重试、已完成或失败。 |
+
+第二个按钮在当前任务结束前禁用，避免同一面板的重复点击创建多张照片。两种操作都不是录像或连续图片上传；网络临时不可用时，数据按钮的记录仍在 Flash 队列中，拍照按钮则明确报告未能创建服务器任务。
 
 ### 第 2 周：任务和新观测验收
 

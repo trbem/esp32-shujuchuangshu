@@ -82,6 +82,10 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(client.get("/api/v1/telemetry", headers={"Host": "ingest.example.test"}).status_code, 404)
         self.assertEqual(client.post("/api/v1/capture-tasks", json={"device_id": "s3eye-001"},
                                      headers={"Host": "ingest.example.test"}).status_code, 404)
+        photo_request = "/api/v1/devices/s3eye-001/capture-photo"
+        self.assertEqual(client.post(photo_request, headers={"Host": "ingest.example.test"}).status_code, 401)
+        created = client.post(photo_request, headers=device_headers)
+        self.assertEqual((created.status_code, created.json()["task_type"]), (201, "capture_photo"))
         self.assertEqual(client.get("/", headers={"Host": "dashboard.example.test"}).status_code, 200)
         self.assertEqual(client.get("/", headers={"Host": "unknown.example.test"}).status_code, 421)
 

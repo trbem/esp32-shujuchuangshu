@@ -138,7 +138,7 @@ extern const char _binary_dashboard_html_end[];
 
 static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t  s_json_lock;
-static char s_json[1280] = "{\"ready\":false}";
+static char s_json[1792] = "{\"ready\":false}";
 static char s_ip[16] = "";
 static int  s_rssi = 0;
 static bool s_wifi_runtime;
@@ -212,6 +212,8 @@ typedef struct {
 
 static const esp_partition_t *s_tlm_partition;
 static SemaphoreHandle_t s_tlm_lock;
+static SemaphoreHandle_t s_tlm_queue_lock;
+static TaskHandle_t s_telemetry_upload_task_handle;
 static telemetry_snapshot_t s_latest_sample;
 static uint64_t s_boot_id;
 static uint32_t s_sample_sequence;
@@ -230,6 +232,14 @@ static telemetry_snapshot_t s_task_result_sample;
 static char s_photo_task_id[37];
 static bool s_photo_upload_pending;
 static int64_t s_photo_captured_at_ms;
+
+/* These fields describe an operation initiated from the board's own web
+ * dashboard. The server remains the source of truth for ACK, completion and
+ * timeout; this is only a concise status mirror for the local operator. */
+static SemaphoreHandle_t s_panel_action_lock;
+static char s_panel_photo_request_id[37];
+static char s_panel_photo_status[24] = "idle";
+static char s_panel_photo_error[64];
 
 /* A single pending classroom interaction is small enough for an atomic NVS
  * blob. It is intentionally separate from telemetry's Flash ring: a button
@@ -1301,22 +1311,44 @@ static bool tlm_post_live_snapshot(const telemetry_snapshot_t *sample)
 static void telemetry_upload_task(void *arg)
 {
     const TickType_t delay = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_UPLOAD_INTERVAL_MS);
+    TickType_t last_periodic = xTaskGetTickCount();
     while (true) {
-        vTaskDelay(delay);
+        /* A local panel click wakes this task straight away, while the short
+         * wait preserves the periodic cadence rather than shifting every
+         * five-second collection after a manual upload. */
+        bool requested = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)) != 0;
+        TickType_t now = xTaskGetTickCount();
+        bool periodic_due = (now - last_periodic) >= delay;
+        if (!requested && !periodic_due) continue;
+
+        if (periodic_due) {
+            last_periodic = now;
+            telemetry_snapshot_t sample;
+            xSemaphoreTake(s_tlm_lock, portMAX_DELAY);
+            sample = s_latest_sample;
+            xSemaphoreGive(s_tlm_lock);
+            /* Keep the durable record even when Wi-Fi has dropped. A later
+             * connected cycle sends it FIFO with the rest of the queue. */
+            if (sample.uptime_s && s_tlm_partition != NULL) {
+                xSemaphoreTake(s_tlm_queue_lock, portMAX_DELAY);
+                tlm_enqueue(&sample);
+                xSemaphoreGive(s_tlm_queue_lock);
+            }
+        }
+
         if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) || s_tlm_partition == NULL) continue;
-        telemetry_snapshot_t sample;
-        xSemaphoreTake(s_tlm_lock, portMAX_DELAY);
-        sample = s_latest_sample;
-        xSemaphoreGive(s_tlm_lock);
-        if (sample.uptime_s) tlm_enqueue(&sample);
 
         telemetry_record_t records[TLM_BATCH_MAX];
         size_t slots[TLM_BATCH_MAX];
+        xSemaphoreTake(s_tlm_queue_lock, portMAX_DELAY);
         size_t count = tlm_load_batch(records, slots, TLM_BATCH_MAX);
+        xSemaphoreGive(s_tlm_queue_lock);
         if (count) {
             s_upload_ok = tlm_post_batch(records, count);
             if (s_upload_ok) {
+                xSemaphoreTake(s_tlm_queue_lock, portMAX_DELAY);
                 tlm_ack_batch(slots, count);
+                xSemaphoreGive(s_tlm_queue_lock);
                 s_last_upload_ms = tlm_now_ms();
             }
         }
@@ -1874,6 +1906,83 @@ static bool task_post_photo(const char *request_id, int64_t captured_at_ms)
     return err == ESP_OK && status >= 200 && status < 300;
 }
 
+static void panel_photo_state_set(const char *request_id, const char *status, const char *error)
+{
+    if (s_panel_action_lock == NULL) return;
+    xSemaphoreTake(s_panel_action_lock, portMAX_DELAY);
+    if (request_id) {
+        snprintf(s_panel_photo_request_id, sizeof(s_panel_photo_request_id), "%s", request_id);
+    }
+    if (status) {
+        snprintf(s_panel_photo_status, sizeof(s_panel_photo_status), "%s", status);
+    }
+    snprintf(s_panel_photo_error, sizeof(s_panel_photo_error), "%s", error ? error : "");
+    xSemaphoreGive(s_panel_action_lock);
+}
+
+static void panel_photo_state_set_if_matches(const char *request_id, const char *status, const char *error)
+{
+    if (s_panel_action_lock == NULL) return;
+    xSemaphoreTake(s_panel_action_lock, portMAX_DELAY);
+    /* A task can be returned by the one-second poll immediately after the
+     * server creates it. While the HTTP handler still says "submitting", bind
+     * that first ACK to its request ID instead of losing the state update. */
+    if (request_id && (strcmp(s_panel_photo_request_id, request_id) == 0 ||
+                       strcmp(s_panel_photo_status, "submitting") == 0)) {
+        if (s_panel_photo_request_id[0] == '\0') {
+            snprintf(s_panel_photo_request_id, sizeof(s_panel_photo_request_id), "%s", request_id);
+        }
+        if (status) snprintf(s_panel_photo_status, sizeof(s_panel_photo_status), "%s", status);
+        snprintf(s_panel_photo_error, sizeof(s_panel_photo_error), "%s", error ? error : "");
+    }
+    xSemaphoreGive(s_panel_action_lock);
+}
+
+static bool panel_photo_begin(void)
+{
+    if (s_panel_action_lock == NULL) return true;
+    xSemaphoreTake(s_panel_action_lock, portMAX_DELAY);
+    bool active = strcmp(s_panel_photo_status, "submitting") == 0 ||
+                  strcmp(s_panel_photo_status, "submitted") == 0 ||
+                  strcmp(s_panel_photo_status, "capturing") == 0 ||
+                  strcmp(s_panel_photo_status, "upload_pending") == 0;
+    if (!active) {
+        s_panel_photo_request_id[0] = '\0';
+        snprintf(s_panel_photo_status, sizeof(s_panel_photo_status), "submitting");
+        s_panel_photo_error[0] = '\0';
+    }
+    xSemaphoreGive(s_panel_action_lock);
+    return !active;
+}
+
+static void panel_photo_submission_succeeded(const char *request_id)
+{
+    if (s_panel_action_lock == NULL) return;
+    xSemaphoreTake(s_panel_action_lock, portMAX_DELAY);
+    if (strcmp(s_panel_photo_status, "submitting") == 0) {
+        snprintf(s_panel_photo_request_id, sizeof(s_panel_photo_request_id), "%s", request_id);
+        snprintf(s_panel_photo_status, sizeof(s_panel_photo_status), "submitted");
+        s_panel_photo_error[0] = '\0';
+    }
+    xSemaphoreGive(s_panel_action_lock);
+}
+
+/* The dashboard lives on the ESP32, so it cannot safely use a browser-side
+ * cross-origin request. This device-authenticated endpoint also remains
+ * available on the restricted ingest hostname. */
+static bool task_create_panel_photo(char request_id[37])
+{
+    char path[128], url[192], response[256];
+    snprintf(path, sizeof(path), "/api/v1/devices/%s/capture-photo", CONFIG_SENSOR_DASH_DEVICE_ID);
+    task_url(url, sizeof(url), path);
+    if (!task_http_request(url, HTTP_METHOD_POST, NULL, response, sizeof(response))) return false;
+    const char *marker = strstr(response, "\"request_id\":\"");
+    if (marker == NULL || strlen(marker + 14) < 37 || marker[14 + 36] != '\"') return false;
+    memcpy(request_id, marker + 14, 36);
+    request_id[36] = '\0';
+    return true;
+}
+
 static void capture_task_poll_task(void *arg)
 {
     const TickType_t delay = pdMS_TO_TICKS(CONFIG_SENSOR_DASH_TASK_POLL_INTERVAL_MS);
@@ -1883,10 +1992,12 @@ static void capture_task_poll_task(void *arg)
         if (s_photo_upload_pending) {
             if (task_post_photo(s_photo_task_id, s_photo_captured_at_ms)) {
                 ESP_LOGI(TAG, "capture-photo uploaded for %.8s", s_photo_task_id);
+                panel_photo_state_set_if_matches(s_photo_task_id, "completed", NULL);
                 s_photo_upload_pending = false;
                 s_photo_task_id[0] = '\0';
             } else {
                 ESP_LOGW(TAG, "capture-photo upload failed for %.8s", s_photo_task_id);
+                panel_photo_state_set_if_matches(s_photo_task_id, "upload_pending", "photo upload retry pending");
             }
             continue;
         }
@@ -1924,6 +2035,7 @@ static void capture_task_poll_task(void *arg)
         ESP_LOGI(TAG, "capture-task ACK sent for %.8s", s_active_task_id);
 
         if (strstr(response, "\"task_type\":\"capture_photo\"")) {
+            panel_photo_state_set_if_matches(s_active_task_id, "capturing", NULL);
             /* Wait beyond the 500 ms metric refresh period so this is a frame
              * captured after the server acknowledged the command, not a cached
              * picture from before the request. */
@@ -1931,6 +2043,7 @@ static void capture_task_poll_task(void *arg)
             if (!camera_copy_latest_to_bmp(s_photo_bmp)) {
                 ESP_LOGW(TAG, "capture-photo camera frame unavailable for %.8s", s_active_task_id);
                 if (task_post_failure(s_active_task_id, "camera frame unavailable")) {
+                    panel_photo_state_set_if_matches(s_active_task_id, "failed", "camera frame unavailable");
                     s_active_task_id[0] = '\0';
                 }
                 continue;
@@ -1942,10 +2055,12 @@ static void capture_task_poll_task(void *arg)
             s_photo_upload_pending = true;
             if (task_post_photo(s_photo_task_id, s_photo_captured_at_ms)) {
                 ESP_LOGI(TAG, "capture-photo uploaded for %.8s", s_photo_task_id);
+                panel_photo_state_set_if_matches(s_photo_task_id, "completed", NULL);
                 s_photo_upload_pending = false;
                 s_photo_task_id[0] = '\0';
             } else {
                 ESP_LOGW(TAG, "capture-photo upload failed for %.8s", s_photo_task_id);
+                panel_photo_state_set_if_matches(s_photo_task_id, "upload_pending", "photo upload retry pending");
             }
             continue;
         }
@@ -1978,6 +2093,76 @@ static esp_err_t index_handler(httpd_req_t *req)
         ESP_LOGE(TAG, "page send failed: %s", esp_err_to_name(e));
     }
     return e;
+}
+
+static esp_err_t panel_action_error(httpd_req_t *req, const char *status, const char *message)
+{
+    char response[160];
+    snprintf(response, sizeof(response), "{\"accepted\":false,\"error\":\"%s\"}", message);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, response);
+    return ESP_FAIL;
+}
+
+/* POST /api/actions/upload-now: record one fresh dashboard snapshot in the
+ * durable queue and immediately ask the FIFO uploader to run. The response is
+ * acceptance, not an invented delivery success. */
+static esp_err_t upload_now_handler(httpd_req_t *req)
+{
+    if (s_tlm_partition == NULL || s_tlm_queue_lock == NULL) {
+        return panel_action_error(req, "503 Service Unavailable", "telemetry queue unavailable");
+    }
+    telemetry_snapshot_t sample;
+    xSemaphoreTake(s_tlm_lock, portMAX_DELAY);
+    sample = s_latest_sample;
+    xSemaphoreGive(s_tlm_lock);
+    if (!sample.uptime_s) {
+        return panel_action_error(req, "503 Service Unavailable", "sensor sample not ready");
+    }
+    xSemaphoreTake(s_tlm_queue_lock, portMAX_DELAY);
+    bool queued = tlm_enqueue(&sample);
+    size_t depth = s_queue_depth;
+    xSemaphoreGive(s_tlm_queue_lock);
+    if (!queued) {
+        return panel_action_error(req, "500 Internal Server Error", "could not queue telemetry");
+    }
+    if (s_telemetry_upload_task_handle) xTaskNotifyGive(s_telemetry_upload_task_handle);
+    char response[96];
+    snprintf(response, sizeof(response), "{\"accepted\":true,\"queued\":%u}", (unsigned)depth);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
+/* POST /api/actions/remote-photo: create exactly one server-side photo task.
+ * The polling task will ACK it, capture a new frame, and upload it using the
+ * existing retry-safe photo path. */
+static esp_err_t remote_photo_handler(httpd_req_t *req)
+{
+    if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT)) {
+        return panel_action_error(req, "503 Service Unavailable", "Wi-Fi is not connected");
+    }
+    if (!panel_photo_begin()) {
+        return panel_action_error(req, "409 Conflict", "a panel photo is already in progress");
+    }
+    char request_id[37];
+    if (!task_create_panel_photo(request_id)) {
+        panel_photo_state_set(NULL, "failed", "server task request failed");
+        return panel_action_error(req, "502 Bad Gateway", "could not create the server photo task");
+    }
+    panel_photo_submission_succeeded(request_id);
+    char response[128];
+    snprintf(response, sizeof(response),
+             "{\"accepted\":true,\"request_id\":\"%s\",\"status\":\"submitted\"}", request_id);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
 }
 
 /* ------------------------- BMP snapshot ------------------------- */
@@ -2119,10 +2304,14 @@ static void start_webserver(void)
     httpd_uri_t index_uri = {.uri = "/", .method = HTTP_GET, .handler = index_handler};
     httpd_uri_t data_uri  = {.uri = "/data", .method = HTTP_GET, .handler = data_handler};
     httpd_uri_t shot_uri  = {.uri = "/shot", .method = HTTP_GET, .handler = shot_handler};
+    httpd_uri_t upload_now_uri = {.uri = "/api/actions/upload-now", .method = HTTP_POST, .handler = upload_now_handler};
+    httpd_uri_t remote_photo_uri = {.uri = "/api/actions/remote-photo", .method = HTTP_POST, .handler = remote_photo_handler};
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &index_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &data_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &shot_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &upload_now_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &remote_photo_uri));
     httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, not_found_handler);
 
     ESP_LOGI(TAG, "web dashboard ready -> http://%s/  (also http://s3eye.local/)", s_ip);
@@ -2134,6 +2323,8 @@ void app_main(void)
 {
     s_json_lock = xSemaphoreCreateMutex();
     s_tlm_lock = xSemaphoreCreateMutex();
+    s_tlm_queue_lock = xSemaphoreCreateMutex();
+    s_panel_action_lock = xSemaphoreCreateMutex();
 
     /* NVS is required by the Wi-Fi driver */
     esp_err_t err = nvs_flash_init();
@@ -2203,7 +2394,8 @@ void app_main(void)
     tlm_start_sntp();
     start_webserver();
     start_mdns();
-    if (xTaskCreate(telemetry_upload_task, "telemetry_upload", 8192, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(telemetry_upload_task, "telemetry_upload", 8192, NULL, 4,
+                    &s_telemetry_upload_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "telemetry_upload task creation failed - nothing will reach the collector");
     }
     if (xTaskCreate(live_telemetry_task, "live_telemetry", 6144, NULL, 4, NULL) != pdPASS) {
@@ -2283,6 +2475,7 @@ void app_main(void)
         }
 
         char interaction_id[37], interaction_type[20], interaction_status[32], interaction_error[64];
+        char panel_photo_request_id[37], panel_photo_status[24], panel_photo_error[64];
         int64_t interaction_occurred_at_ms, interaction_server_received_at_ms, interaction_response_at_ms;
         if (s_interaction_lock) {
             xSemaphoreTake(s_interaction_lock, portMAX_DELAY);
@@ -2312,6 +2505,18 @@ void app_main(void)
             interaction_occurred_at_ms = interaction_server_received_at_ms = interaction_response_at_ms = 0;
         }
 
+        if (s_panel_action_lock) {
+            xSemaphoreTake(s_panel_action_lock, portMAX_DELAY);
+            snprintf(panel_photo_request_id, sizeof(panel_photo_request_id), "%s", s_panel_photo_request_id);
+            snprintf(panel_photo_status, sizeof(panel_photo_status), "%s", s_panel_photo_status);
+            snprintf(panel_photo_error, sizeof(panel_photo_error), "%s", s_panel_photo_error);
+            xSemaphoreGive(s_panel_action_lock);
+        } else {
+            panel_photo_request_id[0] = '\0';
+            snprintf(panel_photo_status, sizeof(panel_photo_status), "unavailable");
+            panel_photo_error[0] = '\0';
+        }
+
         xSemaphoreTake(s_json_lock, portMAX_DELAY);
         int shot_idx = s_cam_ctx.ready;
         snprintf(s_json, sizeof(s_json),
@@ -2327,7 +2532,9 @@ void app_main(void)
                  "\"interaction_event_id\":\"%s\",\"interaction_type\":\"%s\","
                  "\"interaction_status\":\"%s\",\"interaction_occurred_at_ms\":%lld,"
                  "\"interaction_server_received_at_ms\":%lld,\"interaction_response_at_ms\":%lld,"
-                 "\"interaction_error\":\"%s\"}",
+                 "\"interaction_error\":\"%s\","
+                 "\"panel_photo_request_id\":\"%s\",\"panel_photo_status\":\"%s\","
+                 "\"panel_photo_error\":\"%s\"}",
                  temp_c,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),   /* internal SRAM only */
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -2350,7 +2557,8 @@ void app_main(void)
                  interaction_id, interaction_type, interaction_status,
                  (long long)interaction_occurred_at_ms,
                  (long long)interaction_server_received_at_ms,
-                 (long long)interaction_response_at_ms, interaction_error);
+                 (long long)interaction_response_at_ms, interaction_error,
+                 panel_photo_request_id, panel_photo_status, panel_photo_error);
         xSemaphoreGive(s_json_lock);
 
         telemetry_snapshot_t sample = {

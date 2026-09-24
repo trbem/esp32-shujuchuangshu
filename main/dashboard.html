@@ -26,6 +26,19 @@
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
   .badge{border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:12px}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:16px}
+  .actions{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;
+           margin-bottom:16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .actions-copy{flex:1 1 280px}
+  .actions-title{font-size:14px;font-weight:600;margin-bottom:5px}
+  .actions-note{font-size:12px;color:var(--muted);line-height:1.55}
+  .action-buttons{display:flex;gap:9px;flex-wrap:wrap}
+  .action-btn{border:1px solid var(--accent);background:#1f6feb;color:#fff;border-radius:7px;
+              padding:9px 13px;font:600 13px inherit;cursor:pointer;white-space:nowrap}
+  .action-btn.photo{background:#8250df;border-color:#a371f7}
+  .action-btn:hover:not(:disabled){filter:brightness(1.12)}
+  .action-btn:disabled{opacity:.55;cursor:wait}
+  .action-result{flex-basis:100%;font-size:12px;color:var(--muted);min-height:18px}
+  .action-result.ok{color:var(--green)} .action-result.warn{color:var(--yellow)} .action-result.err{color:var(--red)}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;
         position:relative;overflow:hidden}
   .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);opacity:.85}
@@ -90,6 +103,18 @@
   </div>
 
   <div class="grid" id="cards"></div>
+
+  <section class="actions" aria-label="远程数据与拍照操作">
+    <div class="actions-copy">
+      <div class="actions-title">数据上传与远程拍照</div>
+      <div class="actions-note">上传会采集当前指标并写入可靠 Flash 队列；拍照仅创建一条单次服务器任务，不会连续上传画面。</div>
+    </div>
+    <div class="action-buttons">
+      <button class="action-btn" type="button" id="uploadNowBtn">↥ 立即上传数据</button>
+      <button class="action-btn photo" type="button" id="remotePhotoBtn">📷 远程拍照并上传</button>
+    </div>
+    <div class="action-result" id="actionResult" role="status">可从此面板发起一次可靠数据上传或一张远程照片。</div>
+  </section>
 
   <div class="cam">
     <div class="cam-head">
@@ -328,6 +353,45 @@ function setStatus(mode, text){
   document.getElementById('dot').className = 'dot ' + (mode==='live'?'live':mode==='mock'?'mock':'err');
   document.getElementById('srcText').textContent = text;
 }
+function setActionResult(text, tone=''){
+  const out = document.getElementById('actionResult');
+  out.textContent = text;
+  out.className = 'action-result ' + tone;
+}
+function syncPanelPhotoState(d){
+  const state = d.panel_photo_status || 'idle';
+  const id = d.panel_photo_request_id || '';
+  const labels = {submitting:'正在向服务器创建拍照任务', submitted:'已提交，等待板端接收', capturing:'设备已接收，正在拍照',
+    upload_pending:'照片已采集，等待重试上传', completed:'照片已上传到服务器',
+    failed:'拍照任务失败', unavailable:'拍照状态不可用'};
+  const active = state === 'submitting' || state === 'submitted' || state === 'capturing' || state === 'upload_pending';
+  document.getElementById('remotePhotoBtn').disabled = active;
+  if(id || state === 'failed' || state === 'unavailable'){
+    const shortId = id ? ' · ' + id.slice(0, 8) : '';
+    const detail = d.panel_photo_error ? '（' + d.panel_photo_error + '）' : '';
+    setActionResult('远程拍照：' + (labels[state] || state) + shortId + detail,
+      state === 'completed' ? 'ok' : state === 'failed' ? 'err' : active ? 'warn' : '');
+  }
+}
+async function runPanelAction(buttonId, path){
+  const button = document.getElementById(buttonId);
+  button.disabled = true;
+  try{
+    const r = await fetch(path, {method:'POST', cache:'no-store'});
+    const body = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(body.error || body.detail || ('HTTP ' + r.status));
+    if(path.endsWith('upload-now')){
+      setActionResult('当前数据已采集并写入可靠上传队列（队列 ' + (body.queued ?? '--') + ' 条）；顶部状态会显示实际上传结果。', 'ok');
+      button.disabled = false;
+    }else{
+      setActionResult('远程拍照任务已提交 · ' + (body.request_id || '').slice(0, 8) + '；等待设备接收并上传一张 BMP。', 'warn');
+      /* The next /data response keeps this disabled until completion or failure. */
+    }
+  }catch(e){
+    setActionResult('操作未完成：' + e.message, 'err');
+    button.disabled = false;
+  }
+}
 function push(d){
   samples.push(d); if(samples.length > HISTORY) samples.shift();
   renderCards(d); renderCharts();
@@ -355,6 +419,7 @@ function push(d){
   interaction.textContent = '按键事件：' + (interactionLabels[d.interaction_status] || d.interaction_status || '空闲');
   interaction.style.color = d.interaction_status === 'pending_upload' ? 'var(--yellow)' :
     (d.interaction_status === 'server_received' || d.interaction_status === 'viewer_responded' ? 'var(--green)' : '');
+  syncPanelPhotoState(d);
   if(d.jpeg != null) document.getElementById('camMeta').textContent =
     'RGB565 ' + (d.jpeg/1024).toFixed(1) + ' KB / 帧 · ' + (d.fps != null ? d.fps.toFixed(0) + ' fps' : '--') +
     ' · 推屏 ' + (d.lcd_fps != null ? d.lcd_fps.toFixed(0) + ' fps' : '--') +
@@ -400,6 +465,8 @@ function refreshCam(){
 }
 
 buildCards();
+document.getElementById('uploadNowBtn').addEventListener('click', () => runPanelAction('uploadNowBtn', '/api/actions/upload-now'));
+document.getElementById('remotePhotoBtn').addEventListener('click', () => runPanelAction('remotePhotoBtn', '/api/actions/remote-photo'));
 window.addEventListener('resize', renderCharts);
 setInterval(tick, 500);
 setInterval(refreshCam, 250);
